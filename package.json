@@ -1,0 +1,15 @@
+{
+  "name": "squads",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Squads — on-chain lottery pools layered on Megapot. Organizers fund a pool of tickets, players buy fractional shares, winnings split pro rata. Monorepo for the Solidity contracts and (future) webapp.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "pnpm --filter @squads/contracts build",
+    "test": "pnpm --filter @squads/contracts test",
+    "fmt": "pnpm --filter @squads/contracts fmt"
+  },
+  "packageManager": "pnpm@9.12.0"
+}
