@@ -47,10 +47,6 @@ contract MockJackpot {
     // Track referral fees accrued per address (mirrors Megapot's public `referralFees`).
     mapping(address => uint256) public referralFees;
 
-    // Global ticket owner across drawings — backs ownerOf(), so this mock can double as the
-    // JackpotTicketNFT for Squads' batch ticket ownership checks.
-    mapping(uint256 => address) internal _ticketOwners;
-
     constructor(address _usdc, uint256 _ticketPrice, uint256 _drawingDuration) {
         usdc = IERC20(_usdc);
         ticketPrice = _ticketPrice;
@@ -104,18 +100,6 @@ contract MockJackpot {
     function _mint(address recipient) internal returns (uint256 id) {
         id = nextTicketId++;
         drawingsData[currentDrawingId].ticketOwner[id] = recipient;
-        _ticketOwners[id] = recipient;
-    }
-
-    /// @notice ERC-721-style owner lookup, so this mock can stand in for the JackpotTicketNFT.
-    function ownerOf(uint256 ticketId) external view returns (address) {
-        return _ticketOwners[ticketId];
-    }
-
-    /// @notice Test helper: the id the next minted ticket will take (lets a test capture the
-    ///         id range a batch execution mints).
-    function peekNextTicketId() external view returns (uint256) {
-        return nextTicketId;
     }
 
     function _accrueReferral(address[] calldata referrers, uint256[] calldata split, uint256 total) internal {
