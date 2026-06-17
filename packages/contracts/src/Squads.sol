@@ -347,11 +347,29 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     /// @dev Building -> Live: compute autoStake / sharesForSale / pricePerShare and grant autoStake.
+    ///      The value the organizer set as totalShares at creation is the player-facing
+    ///      for-sale supply. The auto-stake is minted ON TOP of it, so the organizer's
+    ///      reimbursement is funded entirely by the for-sale shares (a full sellout returns the
+    ///      full ticketFunding), while the organizer still retains a 2.5% stake.
     function _goLive(Pool storage p) internal {
-        uint256 autoStake = (p.totalShares * AUTO_STAKE_BPS) / BPS_DENOMINATOR;
+        uint256 forSale = p.totalShares;
+
+        // 2.5% of the FINAL total (forSale + autoStake), so the denominator is
+        // BPS_DENOMINATOR - AUTO_STAKE_BPS (9750): autoStake / (forSale + autoStake) == 250/10000.
+        uint256 autoStake = (forSale * AUTO_STAKE_BPS) / (BPS_DENOMINATOR - AUTO_STAKE_BPS);
+
+        p.sharesForSale = forSale;
         p.autoStakeShares = autoStake;
-        p.sharesForSale = p.totalShares - autoStake;
-        p.pricePerShare = p.ticketFunding / p.totalShares;
+        p.totalShares = forSale + autoStake;
+
+        // Price divides by sharesForSale (not totalShares) and rounds UP: the for-sale shares
+        // alone must return at least the full ticketFunding on a sellout, so the organizer is
+        // reimbursed everything they fronted (never short), and every credited cent is backed
+        // by a buyer's payment. Rounding down and crediting the remainder would credit unbacked
+        // USDC and break the cross-pool solvency invariant; rounding up keeps it whole and solvent
+        // (a sellout reimburses ticketFunding plus at most forSale-1 micro-USDC, paid by buyers).
+        p.pricePerShare = (p.ticketFunding + forSale - 1) / forSale;
+
         if (autoStake > 0) _addShares(p, p.organizer, autoStake);
         p.state = State.Live;
     }

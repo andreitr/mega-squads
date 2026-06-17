@@ -274,10 +274,11 @@ contract SquadsTest is Test {
             ,
         ) = squads.getPool(organizer, drawingId);
         assertEq(uint256(state), uint256(Squads.State.Live));
-        assertEq(totalShares, 100);
-        assertEq(autoStakeShares, 2); // 2.5% of 100, floored
-        assertEq(sharesForSale, 98);
-        assertEq(pricePerShare, (5 * TICKET_PRICE) / 100); // 50_000
+        // The createPool value (100) is the for-sale supply; autoStake is minted on top.
+        assertEq(sharesForSale, 100);
+        assertEq(autoStakeShares, 2); // 100 * 250 / 9750, floored
+        assertEq(totalShares, 102); // forSale 100 + autoStake 2
+        assertEq(pricePerShare, (5 * TICKET_PRICE) / 100); // ticketFunding / forSale = 50_000 (even)
         assertEq(squads.sharesOf(organizer, drawingId, organizer), 2); // autoStake granted
         _assertSolvent();
     }
@@ -350,7 +351,7 @@ contract SquadsTest is Test {
         _lock(organizer);
         vm.prank(alice);
         vm.expectRevert(Squads.ExceedsForSale.selector);
-        squads.buyShares(organizer, drawingId, 99); // only 98 for sale
+        squads.buyShares(organizer, drawingId, 101); // only 100 for sale
     }
 
     function test_BuyShares_revertsAfterClose() public {
@@ -368,10 +369,10 @@ contract SquadsTest is Test {
     // ---------------------------------------------------------------------
 
     function test_Settle_winning_soldOut() public {
-        _createPool(organizer, 100);
+        _createPool(organizer, 975); // for-sale supply; autoStake 25 minted on top -> 1000 total
         _addTickets(organizer, 5);
         _lock(organizer);
-        _buy(alice, organizer, 98); // buys every for-sale share -> sold out
+        _buy(alice, organizer, 975); // buys every for-sale share -> sold out
 
         uint256 feesCollected = (5 * TICKET_PRICE * FEE_RATE) / 1e18; // 500_000
 
@@ -385,15 +386,16 @@ contract SquadsTest is Test {
         assertTrue(soldOut);
         assertEq(totalWinnings, 100 * TICKET_PRICE);
 
-        // Winnings pro rata by totalShares (organizer holds autoStake 2, alice 98).
-        // Fees (sold out) also split pro rata by % held.
-        uint256 aliceWin = (100 * TICKET_PRICE * 98) / 100; // 98 USDC
-        uint256 aliceFee = (feesCollected * 98) / 100; // 490_000
+        // Auto-stake on top: organizer holds 25 of 1000 (exactly 2.5%), alice 975. Winnings and
+        // the sold-out fee rebate both split pro rata by totalShares.
+        uint256 aliceWin = (100 * TICKET_PRICE * 975) / 1000; // 97.5 USDC
+        uint256 aliceFee = (feesCollected * 975) / 1000; // 487_500
         assertEq(squads.claimableOf(organizer, drawingId, alice), aliceWin + aliceFee);
 
-        uint256 orgReimburse = squads.quoteShares(organizer, drawingId, 98); // 98 * 50_000
-        uint256 orgWin = (100 * TICKET_PRICE * 2) / 100; // 2 USDC
-        uint256 orgFee = (feesCollected * 2) / 100; // 10_000
+        uint256 orgReimburse = squads.quoteShares(organizer, drawingId, 975); // full reimbursement
+        assertGe(orgReimburse, 5 * TICKET_PRICE); // organizer made whole on what they fronted
+        uint256 orgWin = (100 * TICKET_PRICE * 25) / 1000; // 2.5 USDC
+        uint256 orgFee = (feesCollected * 25) / 1000; // 12_500
         assertEq(squads.claimableOf(organizer, drawingId, organizer), orgReimburse + orgWin + orgFee);
 
         // No fees left locked; counters consistent.
@@ -404,10 +406,10 @@ contract SquadsTest is Test {
     }
 
     function test_Settle_winning_undersold() public {
-        _createPool(organizer, 100);
+        _createPool(organizer, 975); // autoStake 25 on top -> 1000 total
         _addTickets(organizer, 5);
         _lock(organizer);
-        _buy(alice, organizer, 40); // 58 of 98 unsold -> NOT sold out
+        _buy(alice, organizer, 40); // 935 of 975 unsold -> NOT sold out
 
         uint256 feesCollected = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
 
@@ -420,25 +422,25 @@ contract SquadsTest is Test {
         (, bool soldOut,,,,,,,,,,) = squads.getPool(organizer, drawingId);
         assertFalse(soldOut);
 
-        // Organizer absorbs unsold: holds autoStake 2 + unsold 58 = 60 of 100 shares.
-        assertEq(squads.sharesOf(organizer, drawingId, organizer), 60);
+        // Organizer absorbs unsold: holds autoStake 25 + unsold 935 = 960 of 1000 shares.
+        assertEq(squads.sharesOf(organizer, drawingId, organizer), 960);
         assertEq(squads.sharesOf(organizer, drawingId, alice), 40);
 
         // Winnings amplified to the organizer; undersold -> ALL fees to organizer.
-        uint256 aliceWin = (100 * TICKET_PRICE * 40) / 100; // 40 USDC
+        uint256 aliceWin = (100 * TICKET_PRICE * 40) / 1000; // 4 USDC
         assertEq(squads.claimableOf(organizer, drawingId, alice), aliceWin);
 
         uint256 orgReimburse = squads.quoteShares(organizer, drawingId, 40);
-        uint256 orgWin = (100 * TICKET_PRICE * 60) / 100; // 60 USDC
+        uint256 orgWin = (100 * TICKET_PRICE * 960) / 1000; // 96 USDC
         assertEq(squads.claimableOf(organizer, drawingId, organizer), orgReimburse + orgWin + feesCollected);
         _assertSolvent();
     }
 
     function test_Settle_losing() public {
-        _createPool(organizer, 100);
+        _createPool(organizer, 975); // autoStake 25 on top -> 1000 total
         _addTickets(organizer, 5);
         _lock(organizer);
-        _buy(alice, organizer, 98);
+        _buy(alice, organizer, 975); // sold out
 
         _settle();
         // No winners set: every ticket is tier 0 -> skipped, totalWinnings == 0.
@@ -446,9 +448,9 @@ contract SquadsTest is Test {
 
         (,,,,,,,,,, uint256 totalWinnings,) = squads.getPool(organizer, drawingId);
         assertEq(totalWinnings, 0);
-        // Sold out, so the referral fees still get rebated to holders.
+        // Sold out, so the referral fees still get rebated to holders (alice holds 975/1000).
         uint256 feesCollected = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
-        assertEq(squads.claimableOf(organizer, drawingId, alice), (feesCollected * 98) / 100);
+        assertEq(squads.claimableOf(organizer, drawingId, alice), (feesCollected * 975) / 1000);
         _assertSolvent();
     }
 
@@ -471,8 +473,9 @@ contract SquadsTest is Test {
 
         squads.claimAndDistribute(organizer, drawingId);
 
-        // Organizer is the sole holder of all 100 shares -> all winnings + fees.
-        assertEq(squads.sharesOf(organizer, drawingId, organizer), 100);
+        // Organizer is the sole holder of all 102 shares (forSale 100 + autoStake 2) -> all
+        // winnings + fees.
+        assertEq(squads.sharesOf(organizer, drawingId, organizer), 102);
         uint256 feesCollected = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
         assertEq(squads.claimableOf(organizer, drawingId, organizer), 100 * TICKET_PRICE + feesCollected);
         _assertSolvent();
@@ -573,7 +576,7 @@ contract SquadsTest is Test {
         _createPool(organizer, 100);
         _addTickets(organizer, 3);
         _lock(organizer);
-        _buy(alice, organizer, 98);
+        _buy(alice, organizer, 100); // sold out, so the losing pool's fees rebate to alice
         _settle();
 
         vm.prank(admin);
@@ -672,5 +675,82 @@ contract SquadsTest is Test {
 
         assertEq(squads.totalClaimable(), 0);
         assertEq(squads.totalFeesLocked(), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Organizer auto-stake: minted on top of the for-sale supply
+    // ---------------------------------------------------------------------
+
+    function test_AutoStakeIsExactly2Point5Percent() public {
+        _createPool(organizer, 975);
+        _addTickets(organizer, 10);
+        _lock(organizer);
+
+        (,, uint256 totalShares,,, uint256 autoStakeShares,,,,,,) = squads.getPool(organizer, drawingId);
+        assertEq(autoStakeShares, 25);
+        assertEq(totalShares, 1000);
+        // Exactly 2.5% of the FINAL total, not 2.5% of the for-sale slice.
+        assertEq((autoStakeShares * 10_000) / totalShares, 250);
+    }
+
+    function test_FullSelloutReimbursesOrganizerInFull() public {
+        _createPool(organizer, 975);
+        _addTickets(organizer, 10); // ticketFunding = 10 USDC
+        _lock(organizer);
+        _buy(alice, organizer, 975); // full sellout of the for-sale supply
+
+        _settle(); // no winner: organizer's claim is reimbursement + sold-out fee rebate
+        squads.claimAndDistribute(organizer, drawingId);
+
+        uint256 ticketFunding = 10 * TICKET_PRICE;
+        // The for-sale shares alone return at least everything the organizer fronted — they are
+        // made whole (ceil pricing rounds in their favor by at most forSale-1 micro-USDC).
+        uint256 reimburse = squads.quoteShares(organizer, drawingId, 975);
+        assertGe(reimburse, ticketFunding);
+        assertLe(reimburse - ticketFunding, 975);
+        assertGe(squads.claimableOf(organizer, drawingId, organizer), ticketFunding);
+        _assertSolvent();
+    }
+
+    function test_OrganizerRetains2Point5PercentOfWinnings() public {
+        _createPool(organizer, 975);
+        _addTickets(organizer, 10);
+        _lock(organizer);
+        _buy(alice, organizer, 975); // sold out: organizer holds exactly autoStake = 25/1000 = 2.5%
+
+        _settle();
+        uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
+        uint256 prize = 200 * TICKET_PRICE;
+        _setWinner(ids[0], 1, prize);
+        squads.claimAndDistribute(organizer, drawingId);
+
+        // Organizer owns exactly 2.5% of the total, so its winnings cut is prize * 25 / 1000.
+        assertEq(squads.sharesOf(organizer, drawingId, organizer), 25);
+        uint256 feesCollected = (10 * TICKET_PRICE * FEE_RATE) / 1e18;
+        uint256 aliceWin = (prize * 975) / 1000; // 195 USDC
+        uint256 aliceFee = (feesCollected * 975) / 1000;
+        assertEq(squads.claimableOf(organizer, drawingId, alice), aliceWin + aliceFee);
+
+        uint256 orgReimburse = squads.quoteShares(organizer, drawingId, 975);
+        uint256 orgWin = (prize * 25) / 1000; // 5 USDC = 2.5% of the prize
+        uint256 orgFee = (feesCollected * 25) / 1000;
+        assertEq(squads.claimableOf(organizer, drawingId, organizer), orgReimburse + orgWin + orgFee);
+        _assertSolvent();
+    }
+
+    function test_PriceDividesByForSaleNotTotal() public {
+        _createPool(organizer, 975);
+        _addTickets(organizer, 10);
+        _lock(organizer);
+
+        (,, uint256 totalShares, uint256 sharesForSale,,,,, uint256 pricePerShare,,,) =
+            squads.getPool(organizer, drawingId);
+        uint256 ticketFunding = 10 * TICKET_PRICE;
+
+        // Price is computed off the for-sale supply (rounded up), NOT off totalShares.
+        assertEq(pricePerShare, (ticketFunding + sharesForSale - 1) / sharesForSale);
+        assertTrue(pricePerShare != ticketFunding / totalShares); // distinct from the old /total formula
+        // The for-sale shares alone cover the full ticket cost on a sellout.
+        assertGe(pricePerShare * sharesForSale, ticketFunding);
     }
 }
