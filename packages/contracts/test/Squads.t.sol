@@ -9,6 +9,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {MockJackpot} from "./mocks/MockJackpot.sol";
 import {MockRandomTicketBuyer} from "./mocks/MockRandomTicketBuyer.sol";
+import {MockBatchPurchaseFacilitator} from "./mocks/MockBatchPurchaseFacilitator.sol";
 
 contract SquadsTest is Test {
     uint256 internal constant TICKET_PRICE = 1_000_000; // 1 USDC, 6 decimals
@@ -19,6 +20,7 @@ contract SquadsTest is Test {
     MockUSDC internal usdc;
     MockJackpot internal jackpot;
     MockRandomTicketBuyer internal randomBuyer;
+    MockBatchPurchaseFacilitator internal facilitator;
 
     address internal admin = address(0xA11CE);
     address internal organizer = address(0x0123);
@@ -35,7 +37,11 @@ contract SquadsTest is Test {
         usdc = new MockUSDC();
         jackpot = new MockJackpot(address(usdc), TICKET_PRICE, DRAW_DURATION);
         randomBuyer = new MockRandomTicketBuyer(address(usdc), address(jackpot));
-        squads = new Squads(address(usdc), address(jackpot), address(randomBuyer), admin);
+        facilitator = new MockBatchPurchaseFacilitator(address(usdc), address(jackpot));
+        // The MockJackpot doubles as the ticket NFT (it implements ownerOf).
+        squads = new Squads(
+            address(usdc), address(jackpot), address(randomBuyer), address(facilitator), address(jackpot), admin
+        );
 
         drawingId = jackpot.currentDrawingId(); // 1
 
@@ -672,5 +678,210 @@ contract SquadsTest is Test {
 
         assertEq(squads.totalClaimable(), 0);
         assertEq(squads.totalFeesLocked(), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Batch buy (11+ tickets via the facilitator)
+    // ---------------------------------------------------------------------
+
+    function _emptyPicks() internal pure returns (IJackpot.Ticket[] memory) {
+        return new IJackpot.Ticket[](0);
+    }
+
+    /// @dev Create a batch order, have the keeper execute it fully, then record + finalize.
+    function _runBatch(address org, IJackpot.Ticket[] memory custom, uint64 randomCount) internal {
+        uint256 count = custom.length + randomCount;
+        uint256 start = jackpot.peekNextTicketId();
+
+        vm.prank(org);
+        squads.createBatchOrder(drawingId, custom, randomCount);
+
+        facilitator.executeBatchOrder(address(squads), count); // keeper, full execution
+        uint256 end = jackpot.peekNextTicketId();
+
+        uint256[] memory ids = new uint256[](end - start);
+        for (uint256 i; i < ids.length; i++) {
+            ids[i] = start + i;
+        }
+        squads.recordBatchTickets(org, drawingId, ids);
+        squads.finalizeBatchOrder(org, drawingId);
+    }
+
+    function test_Batch_fullLifecycle() public {
+        _createPool(organizer, 100);
+        _runBatch(organizer, _emptyPicks(), 15); // 15 random tickets via the facilitator
+
+        (,,,,,, uint256 ticketCount,,, uint256 ticketFunding,, uint256 feesCollected) =
+            squads.getPool(organizer, drawingId);
+        assertEq(ticketCount, 15);
+        assertEq(ticketFunding, 15 * TICKET_PRICE);
+        assertEq(feesCollected, (15 * TICKET_PRICE * FEE_RATE) / 1e18);
+        (bool pending,,,) = squads.getBatchOrder(organizer, drawingId);
+        assertFalse(pending);
+        _assertSolvent();
+
+        // Pool behaves normally from here.
+        _lock(organizer);
+        _buy(alice, organizer, 98);
+        _settle();
+        uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
+        _setWinner(ids[0], 1, 100 * TICKET_PRICE);
+        squads.claimAndDistribute(organizer, drawingId);
+        assertGt(squads.claimableOf(organizer, drawingId, alice), 0);
+        _assertSolvent();
+    }
+
+    function test_Batch_mixedCustomAndRandom() public {
+        _createPool(organizer, 100);
+        _runBatch(organizer, _picks(5), 7); // 5 custom + 7 random = 12
+
+        (,,,,,, uint256 ticketCount,,,,,) = squads.getPool(organizer, drawingId);
+        assertEq(ticketCount, 12);
+        assertEq(squads.getTicketIds(organizer, drawingId).length, 12);
+        _assertSolvent();
+    }
+
+    function test_Batch_mixesWithSyncBuys() public {
+        _createPool(organizer, 100);
+        _addTickets(organizer, 4); // synchronous custom buy
+        _runBatch(organizer, _emptyPicks(), 11); // batch on the same pool
+        (,,,,,, uint256 ticketCount,,, uint256 ticketFunding,,) = squads.getPool(organizer, drawingId);
+        assertEq(ticketCount, 15);
+        assertEq(ticketFunding, 15 * TICKET_PRICE);
+        _assertSolvent();
+    }
+
+    function test_Batch_executesInChunks() public {
+        _createPool(organizer, 100);
+        uint256 start = jackpot.peekNextTicketId();
+        vm.prank(organizer);
+        squads.createBatchOrder(drawingId, _emptyPicks(), 12);
+
+        // Keeper executes across two transactions.
+        facilitator.executeBatchOrder(address(squads), 5);
+        facilitator.executeBatchOrder(address(squads), 7);
+        uint256 end = jackpot.peekNextTicketId();
+
+        uint256[] memory ids = new uint256[](end - start);
+        for (uint256 i; i < ids.length; i++) {
+            ids[i] = start + i;
+        }
+        squads.recordBatchTickets(organizer, drawingId, ids);
+        squads.finalizeBatchOrder(organizer, drawingId);
+
+        (,,,,,, uint256 ticketCount,,,,,) = squads.getPool(organizer, drawingId);
+        assertEq(ticketCount, 12);
+        _assertSolvent();
+    }
+
+    function test_Batch_revertsBelowMinimum() public {
+        _createPool(organizer, 100);
+        vm.prank(organizer);
+        vm.expectRevert(Squads.InvalidTicketCount.selector); // 9 < minimumTicketCount (10)
+        squads.createBatchOrder(drawingId, _emptyPicks(), 9);
+    }
+
+    function test_Batch_onlyOneOrderInFlight() public {
+        _createPool(organizer, 100);
+        vm.prank(organizer);
+        squads.createBatchOrder(drawingId, _emptyPicks(), 12); // org's order now active
+
+        address org2 = address(0xBEEF);
+        _fund(org2, 100 * TICKET_PRICE);
+        vm.prank(org2);
+        squads.createPool(drawingId, 100, _closeTime(), "Squad 2");
+        // Squads is the recipient for every pool, so only one batch order can be in flight.
+        vm.prank(org2);
+        vm.expectRevert(Squads.BatchOrderActive.selector);
+        squads.createBatchOrder(drawingId, _emptyPicks(), 12);
+    }
+
+    function test_Batch_lockBlockedWhilePending() public {
+        _createPool(organizer, 100);
+        vm.prank(organizer);
+        squads.createBatchOrder(drawingId, _emptyPicks(), 12);
+        vm.prank(organizer);
+        vm.expectRevert(Squads.BatchStillPending.selector);
+        squads.lock(drawingId);
+    }
+
+    function test_Batch_recordRejectsUnownedTicket() public {
+        _createPool(organizer, 100);
+        vm.prank(organizer);
+        squads.createBatchOrder(drawingId, _emptyPicks(), 12);
+        facilitator.executeBatchOrder(address(squads), 12);
+
+        uint256[] memory bad = new uint256[](1);
+        bad[0] = 99_999; // never minted to Squads
+        vm.expectRevert(abi.encodeWithSelector(Squads.TicketNotOwned.selector, uint256(99_999)));
+        squads.recordBatchTickets(organizer, drawingId, bad);
+    }
+
+    function test_Batch_recordRejectsAlreadyRegistered() public {
+        _createPool(organizer, 100);
+        _addTickets(organizer, 1); // ticket id 1 minted to Squads and registered
+        uint256[] memory syncIds = squads.getTicketIds(organizer, drawingId);
+
+        vm.prank(organizer);
+        squads.createBatchOrder(drawingId, _emptyPicks(), 12);
+        facilitator.executeBatchOrder(address(squads), 12);
+
+        // Squads owns the sync ticket, but it's already attributed to the pool.
+        vm.expectRevert(abi.encodeWithSelector(Squads.TicketAlreadyRegistered.selector, syncIds[0]));
+        squads.recordBatchTickets(organizer, drawingId, syncIds);
+    }
+
+    function test_Batch_finalizeRevertsIfTicketsUnrecorded() public {
+        _createPool(organizer, 100);
+        uint256 start = jackpot.peekNextTicketId();
+        vm.prank(organizer);
+        squads.createBatchOrder(drawingId, _emptyPicks(), 15);
+        facilitator.executeBatchOrder(address(squads), 15); // all 15 minted, order complete
+
+        // Record only 10 of the 15 minted tickets, then try to finalize.
+        uint256[] memory someIds = new uint256[](10);
+        for (uint256 i; i < 10; i++) {
+            someIds[i] = start + i;
+        }
+        squads.recordBatchTickets(organizer, drawingId, someIds);
+
+        // Finalize would credit a refund for 5 "unspent" tickets that were actually bought —
+        // the solvency guard blocks it, forcing all tickets to be recorded first.
+        vm.expectRevert(Squads.Insolvent.selector);
+        squads.finalizeBatchOrder(organizer, drawingId);
+    }
+
+    function test_Batch_partialFill_refundsOrganizer() public {
+        _createPool(organizer, 100);
+        uint256 start = jackpot.peekNextTicketId();
+        vm.prank(organizer);
+        squads.createBatchOrder(drawingId, _emptyPicks(), 15); // funds 15 tickets
+
+        // Keeper only manages 10, then the organizer aborts the rest.
+        facilitator.executeBatchOrder(address(squads), 10);
+        vm.prank(organizer);
+        squads.cancelBatchOrder(drawingId); // facilitator refunds 5 * price to Squads
+
+        uint256[] memory ids = new uint256[](10);
+        for (uint256 i; i < 10; i++) {
+            ids[i] = start + i;
+        }
+        squads.recordBatchTickets(organizer, drawingId, ids);
+
+        uint256 claimableBefore = squads.claimableOf(organizer, drawingId, organizer);
+        squads.finalizeBatchOrder(organizer, drawingId);
+
+        // Organizer is refunded the 5 unspent tickets' funding.
+        uint256 refund = 5 * TICKET_PRICE;
+        assertEq(squads.claimableOf(organizer, drawingId, organizer), claimableBefore + refund);
+        (,,,,,, uint256 ticketCount,,, uint256 ticketFunding,,) = squads.getPool(organizer, drawingId);
+        assertEq(ticketCount, 10);
+        assertEq(ticketFunding, 10 * TICKET_PRICE);
+        _assertSolvent();
+
+        // And the pool can proceed normally.
+        _lock(organizer);
+        _buy(alice, organizer, 50);
+        _assertSolvent();
     }
 }

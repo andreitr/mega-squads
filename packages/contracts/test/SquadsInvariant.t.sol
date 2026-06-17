@@ -7,6 +7,7 @@ import {IJackpot} from "../src/interfaces/IJackpot.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {MockJackpot} from "./mocks/MockJackpot.sol";
 import {MockRandomTicketBuyer} from "./mocks/MockRandomTicketBuyer.sol";
+import {MockBatchPurchaseFacilitator} from "./mocks/MockBatchPurchaseFacilitator.sol";
 
 /**
  * @notice Stateful fuzzing of the cross-pool solvency invariant — the headline risk of
@@ -19,6 +20,7 @@ contract SquadsHandler is Test {
     Squads public squads;
     MockUSDC public usdc;
     MockJackpot public jackpot;
+    MockBatchPurchaseFacilitator public facilitator;
 
     address[] internal actors;
 
@@ -29,10 +31,17 @@ contract SquadsHandler is Test {
 
     Ref[] internal refs;
 
-    constructor(Squads _squads, MockUSDC _usdc, MockJackpot _jackpot, address[] memory _actors) {
+    constructor(
+        Squads _squads,
+        MockUSDC _usdc,
+        MockJackpot _jackpot,
+        MockBatchPurchaseFacilitator _facilitator,
+        address[] memory _actors
+    ) {
         squads = _squads;
         usdc = _usdc;
         jackpot = _jackpot;
+        facilitator = _facilitator;
         actors = _actors;
     }
 
@@ -105,6 +114,32 @@ contract SquadsHandler is Test {
         vm.prank(_actor(actorSeed));
         try squads.withdraw(r.org, r.draw) {} catch {}
     }
+
+    /// @dev Drive the whole batch path in one action (create -> keeper-execute -> record ->
+    ///      finalize), so the single batch-order slot never stays occupied across calls.
+    function runBatch(uint256 refSeed, uint256 count) public {
+        if (refs.length == 0) return;
+        Ref memory r = refs[refSeed % refs.length];
+        count = bound(count, 10, 20);
+
+        IJackpot.Ticket[] memory empty = new IJackpot.Ticket[](0);
+        uint256 start = jackpot.peekNextTicketId();
+        vm.prank(r.org);
+        try squads.createBatchOrder(r.draw, empty, uint64(count)) {}
+        catch {
+            return;
+        }
+
+        // Keeper executes the whole order, then anyone records + finalizes.
+        try facilitator.executeBatchOrder(address(squads), count) {} catch {}
+        uint256 end = jackpot.peekNextTicketId();
+        uint256[] memory ids = new uint256[](end - start);
+        for (uint256 i; i < ids.length; i++) {
+            ids[i] = start + i;
+        }
+        try squads.recordBatchTickets(r.org, r.draw, ids) {} catch {}
+        try squads.finalizeBatchOrder(r.org, r.draw) {} catch {}
+    }
 }
 
 contract SquadsInvariantTest is Test {
@@ -112,6 +147,7 @@ contract SquadsInvariantTest is Test {
     MockUSDC internal usdc;
     MockJackpot internal jackpot;
     MockRandomTicketBuyer internal randomBuyer;
+    MockBatchPurchaseFacilitator internal facilitator;
     SquadsHandler internal handler;
 
     function setUp() public {
@@ -119,7 +155,10 @@ contract SquadsInvariantTest is Test {
         usdc = new MockUSDC();
         jackpot = new MockJackpot(address(usdc), 1_000_000, 1 days);
         randomBuyer = new MockRandomTicketBuyer(address(usdc), address(jackpot));
-        squads = new Squads(address(usdc), address(jackpot), address(randomBuyer), address(this));
+        facilitator = new MockBatchPurchaseFacilitator(address(usdc), address(jackpot));
+        squads = new Squads(
+            address(usdc), address(jackpot), address(randomBuyer), address(facilitator), address(jackpot), address(this)
+        );
 
         address[] memory actors = new address[](4);
         actors[0] = address(0xA1);
@@ -134,7 +173,7 @@ contract SquadsInvariantTest is Test {
         // Buffer so the Jackpot can always honor referral sweeps and any payouts.
         usdc.mint(address(jackpot), 1_000_000 * 1_000_000);
 
-        handler = new SquadsHandler(squads, usdc, jackpot, actors);
+        handler = new SquadsHandler(squads, usdc, jackpot, facilitator, actors);
         targetContract(address(handler));
     }
 

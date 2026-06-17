@@ -3,12 +3,14 @@ pragma solidity ^0.8.24;
 
 import {IJackpot} from "./interfaces/IJackpot.sol";
 import {IRandomTicketBuyer} from "./interfaces/IRandomTicketBuyer.sol";
+import {IBatchPurchaseFacilitator} from "./interfaces/IBatchPurchaseFacilitator.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
 /**
  * @title  Squads
@@ -115,6 +117,13 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     ///         working quick-pick of its own).
     IRandomTicketBuyer public immutable RANDOM_BUYER;
 
+    /// @notice Megapot's batch facilitator, used by createBatchOrder for 11+ ticket orders.
+    IBatchPurchaseFacilitator public immutable BATCH_FACILITATOR;
+
+    /// @notice Megapot's ticket NFT. Used to verify Squads actually owns each async,
+    ///         keeper-minted batch ticket before registering it to a pool.
+    IERC721 public immutable TICKET_NFT;
+
     // -----------------------------------------------------------------------
     // State
     // -----------------------------------------------------------------------
@@ -141,6 +150,10 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         uint256 pricePerShare; // fixed at lock = ticketFunding / totalShares
         uint256 totalWinnings; // set at distribution
         uint256 feesCollected; // referral fees swept, locked until release
+        bool batchPending; // an in-flight / unfinalized batch order exists for this pool
+        uint256 batchFunded; // USDC the organizer pre-paid for the active batch order
+        uint256 batchExpected; // tickets ordered in the active batch order
+        uint256 batchRecorded; // batch tickets registered so far for the active order
         uint256[] ticketIds; // Megapot NFTs held for this pool
         address[] holders; // distinct share holders, in first-acquire order
         mapping(address => bool) isHolder;
@@ -159,6 +172,16 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
 
     /// @notice Sum of every pool's swept-but-unreleased referral fees. Other half of the invariant.
     uint256 public totalFeesLocked;
+
+    /// @notice The pool key with the currently-active (uncfinalized) batch order, or 0 if none.
+    ///         Megapot keys batch orders by recipient, and Squads is the recipient for every
+    ///         pool, so only ONE batch order can be in flight across all pools at a time.
+    bytes32 public activeBatchKey;
+
+    /// @notice Every Megapot ticket id already attributed to a pool. Prevents a batch ticket
+    ///         from being registered to two pools, and stops the synchronous paths' tickets
+    ///         from being re-registered.
+    mapping(uint256 => bool) public ticketRegistered;
 
     // -----------------------------------------------------------------------
     // Events
@@ -191,6 +214,13 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     );
     event Withdrawn(address indexed organizer, uint256 indexed drawingId, address indexed account, uint256 amount);
     event PoolCancelled(address indexed organizer, uint256 indexed drawingId);
+    event BatchOrderCreated(
+        address indexed organizer, uint256 indexed drawingId, uint256 count, uint256 cost, uint256 dynamicCount
+    );
+    event BatchTicketsRecorded(
+        address indexed organizer, uint256 indexed drawingId, uint256 count, uint256 newTicketCount, uint256 feeSwept
+    );
+    event BatchOrderFinalized(address indexed organizer, uint256 indexed drawingId, uint256 recorded, uint256 refund);
 
     // -----------------------------------------------------------------------
     // Errors
@@ -213,6 +243,13 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     error TicketsAlreadyBought();
     error ZeroAmount();
     error NothingToWithdraw();
+    error BatchOrderActive();
+    error NoBatchOrder();
+    error BatchOrderNotComplete();
+    error BatchStillPending();
+    error TicketNotOwned(uint256 ticketId);
+    error TicketAlreadyRegistered(uint256 ticketId);
+    error Insolvent();
 
     // -----------------------------------------------------------------------
     // Constructor
@@ -221,19 +258,34 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     /// @param _usdc        Base mainnet USDC address.
     /// @param _jackpot     Megapot Jackpot contract (buy + claim + reads).
     /// @param _randomBuyer Megapot JackpotRandomTicketBuyer (quick-pick purchases).
+    /// @param _batchFacilitator Megapot BatchPurchaseFacilitator (11+ ticket orders).
+    /// @param _ticketNFT   Megapot JackpotTicketNFT (ownership check for batch tickets).
     /// @param _owner       Admin address (pause only). Zero reverts via OZ Ownable.
-    constructor(address _usdc, address _jackpot, address _randomBuyer, address _owner) Ownable(_owner) {
-        if (_usdc == address(0) || _jackpot == address(0) || _randomBuyer == address(0)) {
+    constructor(
+        address _usdc,
+        address _jackpot,
+        address _randomBuyer,
+        address _batchFacilitator,
+        address _ticketNFT,
+        address _owner
+    ) Ownable(_owner) {
+        if (
+            _usdc == address(0) || _jackpot == address(0) || _randomBuyer == address(0)
+                || _batchFacilitator == address(0) || _ticketNFT == address(0)
+        ) {
             revert ZeroAddress();
         }
         USDC = IERC20(_usdc);
         JACKPOT = IJackpot(_jackpot);
         RANDOM_BUYER = IRandomTicketBuyer(_randomBuyer);
+        BATCH_FACILITATOR = IBatchPurchaseFacilitator(_batchFacilitator);
+        TICKET_NFT = IERC721(_ticketNFT);
 
-        // Both the Jackpot (explicit-pick buyTickets) and the random buyer pull USDC on
-        // each purchase; claims push to us, so they need no approval.
+        // The Jackpot (explicit-pick buyTickets), the random buyer, and the batch
+        // facilitator each pull USDC on purchase; claims push to us, so no approval there.
         IERC20(_usdc).forceApprove(_jackpot, type(uint256).max);
         IERC20(_usdc).forceApprove(_randomBuyer, type(uint256).max);
+        IERC20(_usdc).forceApprove(_batchFacilitator, type(uint256).max);
     }
 
     // -----------------------------------------------------------------------
@@ -285,6 +337,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         (address[] memory referrers, uint256[] memory split) = _selfReferral();
         uint256[] memory ids = JACKPOT.buyTickets(tickets, address(this), referrers, split, SOURCE);
         for (uint256 i = 0; i < ids.length; i++) {
+            ticketRegistered[ids[i]] = true;
             p.ticketIds.push(ids[i]);
         }
 
@@ -302,6 +355,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         (address[] memory referrers, uint256[] memory split) = _selfReferral();
         uint256[] memory ids = RANDOM_BUYER.buyTickets(count, address(this), referrers, split, SOURCE);
         for (uint256 i = 0; i < ids.length; i++) {
+            ticketRegistered[ids[i]] = true;
             p.ticketIds.push(ids[i]);
         }
 
@@ -333,6 +387,120 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     // -----------------------------------------------------------------------
+    // Batch buy: 11+ tickets via the facilitator (async, keeper-executed)
+    // -----------------------------------------------------------------------
+
+    /// @notice Open a batch order for 11+ tickets (the Jackpot's direct buy caps at 10). The
+    ///         order may mix `randomCount` quick-pick tickets with explicit `customPicks`. The
+    ///         organizer pre-funds the whole order; an off-chain Megapot keeper then mints the
+    ///         tickets to Squads across one or more transactions. Because Megapot keys batch
+    ///         orders by recipient (always Squads), only ONE batch order can be in flight
+    ///         across all pools at a time.
+    ///
+    ///         Flow: createBatchOrder → (keeper executes) → recordBatchTickets(ids…) →
+    ///         finalizeBatchOrder → lock.
+    function createBatchOrder(uint256 drawingId, IJackpot.Ticket[] calldata customPicks, uint64 randomCount)
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        uint256 count = uint256(randomCount) + customPicks.length;
+        if (count < BATCH_FACILITATOR.minimumTicketCount()) revert InvalidTicketCount();
+
+        Pool storage p = _pool(msg.sender, drawingId);
+        if (p.state != State.Building) revert WrongState();
+        if (activeBatchKey != bytes32(0)) revert BatchOrderActive(); // one order in flight at a time
+        if (p.ticketCount + count > MAX_POOL_TICKETS) revert TooManyTickets();
+        if (JACKPOT.currentDrawingId() != drawingId) revert DrawingNotOpen();
+
+        uint256 cost = JACKPOT.getDrawingState(drawingId).ticketPrice * count;
+        // Pull the full order cost from the organizer; the facilitator pulls it from us.
+        USDC.safeTransferFrom(msg.sender, address(this), cost);
+
+        (address[] memory referrers, uint256[] memory split) = _selfReferral();
+        BATCH_FACILITATOR.createBatchOrder(address(this), randomCount, customPicks, referrers, split);
+
+        p.batchPending = true;
+        p.batchFunded = cost;
+        p.batchExpected = count;
+        p.batchRecorded = 0;
+        activeBatchKey = _key(msg.sender, drawingId);
+
+        emit BatchOrderCreated(msg.sender, drawingId, count, cost, randomCount);
+    }
+
+    /// @notice Register batch tickets the keeper has minted to Squads. Permissionless and
+    ///         batchable — pass IDs read from the facilitator's BatchOrderExecuted events. Each
+    ///         id must be owned by Squads and not already attributed to a pool, which makes
+    ///         registration trustless. Bumps the pool's ticket count + funding and sweeps the
+    ///         batch's referral fee.
+    function recordBatchTickets(address organizer, uint256 drawingId, uint256[] calldata ticketIds)
+        external
+        nonReentrant
+    {
+        Pool storage p = _pool(organizer, drawingId);
+        if (!p.batchPending) revert NoBatchOrder();
+
+        uint256 price = JACKPOT.getDrawingState(drawingId).ticketPrice;
+        uint256 n = ticketIds.length;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 id = ticketIds[i];
+            if (ticketRegistered[id]) revert TicketAlreadyRegistered(id);
+            if (TICKET_NFT.ownerOf(id) != address(this)) revert TicketNotOwned(id);
+            ticketRegistered[id] = true;
+            p.ticketIds.push(id);
+        }
+        p.ticketCount += n;
+        p.batchRecorded += n;
+        p.ticketFunding += n * price;
+
+        uint256 swept = _sweepReferralFees(p);
+        emit BatchTicketsRecorded(organizer, drawingId, n, p.ticketCount, swept);
+    }
+
+    /// @notice Close out a completed batch order: refund the organizer any USDC the order did
+    ///         not spend (e.g. a partial fill) and free the single batch-order slot so the pool
+    ///         can lock and other pools can batch. Requires the facilitator to report the order
+    ///         finished, and is guarded by the solvency invariant — a refund can never be
+    ///         credited beyond what the facilitator actually returned, which forces callers to
+    ///         record every minted ticket before finalizing.
+    function finalizeBatchOrder(address organizer, uint256 drawingId) external nonReentrant {
+        Pool storage p = _pool(organizer, drawingId);
+        if (!p.batchPending) revert NoBatchOrder();
+        if (BATCH_FACILITATOR.hasActiveBatchOrder(address(this))) revert BatchOrderNotComplete();
+
+        // Sweep any last referral accrued by the order before closing it out.
+        _sweepReferralFees(p);
+
+        uint256 spent = p.batchRecorded * JACKPOT.getDrawingState(drawingId).ticketPrice;
+        uint256 refund = p.batchFunded > spent ? p.batchFunded - spent : 0;
+
+        p.batchPending = false;
+        p.batchFunded = 0;
+        p.batchExpected = 0;
+        p.batchRecorded = 0;
+        activeBatchKey = bytes32(0);
+
+        if (refund > 0) _credit(p, organizer, refund); // organizer's unspent pre-funding
+
+        // The facilitator's refund USDC must already be here; if a caller tried to finalize
+        // without recording every minted ticket, the computed refund would exceed it and this
+        // reverts — keeping the contract solvent and forcing all tickets to be recorded first.
+        _requireSolvent();
+
+        emit BatchOrderFinalized(organizer, drawingId, p.ticketCount, refund);
+    }
+
+    /// @notice Organizer aborts an in-flight batch order. The facilitator refunds the unspent
+    ///         USDC to Squads; record any tickets the keeper already minted, then call
+    ///         {finalizeBatchOrder} to reconcile the refund and free the slot.
+    function cancelBatchOrder(uint256 drawingId) external nonReentrant {
+        Pool storage p = _pool(msg.sender, drawingId);
+        if (!p.batchPending) revert NoBatchOrder();
+        BATCH_FACILITATOR.cancelBatchOrder();
+    }
+
+    // -----------------------------------------------------------------------
     // Lock: freeze the ticket set, fix the price, go live
     // -----------------------------------------------------------------------
 
@@ -341,6 +509,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     function lock(uint256 drawingId) external whenNotPaused {
         Pool storage p = _pool(msg.sender, drawingId);
         if (p.state != State.Building) revert WrongState();
+        if (p.batchPending) revert BatchStillPending();
         if (p.ticketCount == 0) revert NoTickets();
         _goLive(p);
         emit PoolLocked(msg.sender, drawingId, p.ticketFunding, p.pricePerShare, p.sharesForSale, p.autoStakeShares);
@@ -412,6 +581,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     ///         out, otherwise to holders pro rata by % held. Dust rounds to the organizer.
     function claimAndDistribute(address organizer, uint256 drawingId) external nonReentrant {
         Pool storage p = _pool(organizer, drawingId);
+        if (p.batchPending) revert BatchStillPending(); // finalize the batch order first
 
         // A pool the organizer never locked still owns its tickets; finalize it to the
         // organizer (sole holder) so funds are never stranded.
@@ -584,6 +754,12 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         totalFeesLocked += swept;
     }
 
+    /// @dev Revert unless outstanding liabilities are fully backed by the USDC balance. Used
+    ///      as an active guard on batch-order refunds, not just a test assertion.
+    function _requireSolvent() internal view {
+        if (totalClaimable + totalFeesLocked > USDC.balanceOf(address(this))) revert Insolvent();
+    }
+
     // -----------------------------------------------------------------------
     // Views
     // -----------------------------------------------------------------------
@@ -627,6 +803,17 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     /// @notice Whether a pool exists at (organizer, drawingId).
     function poolExists(address organizer, uint256 drawingId) external view returns (bool) {
         return pools[_key(organizer, drawingId)].state != State.None;
+    }
+
+    /// @notice Batch-order status for a pool: whether one is pending, the USDC pre-funded,
+    ///         the tickets ordered, and how many have been recorded so far.
+    function getBatchOrder(address organizer, uint256 drawingId)
+        external
+        view
+        returns (bool pending, uint256 funded, uint256 expected, uint256 recorded)
+    {
+        Pool storage p = pools[_key(organizer, drawingId)];
+        return (p.batchPending, p.batchFunded, p.batchExpected, p.batchRecorded);
     }
 
     function sharesOf(address organizer, uint256 drawingId, address account) external view returns (uint256) {

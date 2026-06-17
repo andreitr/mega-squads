@@ -23,6 +23,8 @@ contract Deploy is Script {
     address internal constant BASE_USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address internal constant BASE_JACKPOT = 0x3bAe643002069dBCbcd62B1A4eb4C4A397d042a2;
     address internal constant BASE_RANDOM_BUYER = 0xb9560b43b91dE2c1DaF5dfbb76b2CFcDaFc13aBd;
+    address internal constant BASE_BATCH_FACILITATOR = 0x01774B531591b286b9f02C6Bc02ab3fD9526Aa76;
+    address internal constant BASE_TICKET_NFT = 0x48FfE35AbB9f4780a4f1775C2Ce1c46185b366e4;
 
     /// @notice Initial contract owner (pause admin). Override with OWNER_ADDRESS.
     address internal constant INITIAL_OWNER = 0x1d671d1B191323A38490972D58354971E5c1cd2A;
@@ -31,16 +33,20 @@ contract Deploy is Script {
         address usdc = vm.envOr("USDC_ADDRESS", BASE_USDC);
         address jackpot = vm.envOr("JACKPOT_ADDRESS", BASE_JACKPOT);
         address randomBuyer = vm.envOr("RANDOM_BUYER_ADDRESS", BASE_RANDOM_BUYER);
+        address batchFacilitator = vm.envOr("BATCH_FACILITATOR_ADDRESS", BASE_BATCH_FACILITATOR);
+        address ticketNFT = vm.envOr("TICKET_NFT_ADDRESS", BASE_TICKET_NFT);
         address owner = vm.envOr("OWNER_ADDRESS", INITIAL_OWNER);
 
         vm.startBroadcast();
-        squads = new Squads(usdc, jackpot, randomBuyer, owner);
+        squads = new Squads(usdc, jackpot, randomBuyer, batchFacilitator, ticketNFT, owner);
         vm.stopBroadcast();
 
         console.log("Squads deployed at:", address(squads));
-        console.log("  USDC:        ", usdc);
-        console.log("  Jackpot:     ", jackpot);
-        console.log("  randomBuyer: ", randomBuyer);
-        console.log("  owner:       ", owner);
+        console.log("  USDC:             ", usdc);
+        console.log("  Jackpot:          ", jackpot);
+        console.log("  randomBuyer:      ", randomBuyer);
+        console.log("  batchFacilitator: ", batchFacilitator);
+        console.log("  ticketNFT:        ", ticketNFT);
+        console.log("  owner:            ", owner);
     }
 }
