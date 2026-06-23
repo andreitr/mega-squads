@@ -82,9 +82,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     ///         drawingTime. Kills last-second front-running of a near-certain outcome.
     uint256 public constant MIN_SELLING_WINDOW = 1 hours;
 
-    /// @notice Free shares granted to the organizer at lock, in basis points of totalShares.
-    uint256 public constant AUTO_STAKE_BPS = 250; // 2.5%
-
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
     /// @notice Megapot's per-call ticket cap (buyTickets reverts with InvalidTicketCount
@@ -132,9 +129,10 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         bool soldOut;
         uint256 drawingId;
         uint256 totalShares;
-        uint256 sharesForSale; // totalShares - autoStake; set at lock
+        uint256 reserveBps; // organizer-chosen reserve, in basis points of totalShares; set at creation
+        uint256 sharesForSale; // totalShares - reserveShares; set at lock
         uint256 sharesSold; // shares bought by players during Live
-        uint256 autoStakeShares; // free shares granted to organizer at lock
+        uint256 reserveShares; // shares the organizer keeps off the market (carved out); set at lock
         uint256 ticketCount;
         uint64 salesCloseTime;
         uint256 ticketFunding; // USDC the organizer fronted for tickets
@@ -165,7 +163,12 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     // -----------------------------------------------------------------------
 
     event PoolCreated(
-        address indexed organizer, uint256 indexed drawingId, uint256 totalShares, uint64 salesCloseTime, string name
+        address indexed organizer,
+        uint256 indexed drawingId,
+        uint256 totalShares,
+        uint256 reserveBps,
+        uint64 salesCloseTime,
+        string name
     );
     event TicketsAdded(
         address indexed organizer, uint256 indexed drawingId, uint256 count, uint256 newTicketCount, uint256 feeSwept
@@ -176,7 +179,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         uint256 ticketFunding,
         uint256 pricePerShare,
         uint256 sharesForSale,
-        uint256 autoStakeShares
+        uint256 reserveShares
     );
     event SharesPurchased(
         address indexed organizer,
@@ -198,6 +201,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
 
     error ZeroAddress();
     error InvalidShares();
+    error InvalidReserve();
     error InvalidTicketCount();
     error TooManyTickets();
     error PoolExists();
@@ -245,13 +249,23 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     ///         bought via {addTickets} / {addRandomTickets}.
     /// @param drawingId      Must equal Megapot's current (open) drawing id.
     /// @param totalShares    Fixed share supply (e.g. 100 = one share per 1%). 1..MAX_TOTAL_SHARES.
+    /// @param reserveBps     The percentage of the pool (in basis points) the organizer keeps for
+    ///                       themselves and does not sell. 0 is valid (sell the whole pool); must
+    ///                       be < 100% so at least one share is left for players to buy. The
+    ///                       organizer pays for the reserve via foregone reimbursement (carve-out).
     /// @param salesCloseTime When share sales close. Must leave >= MIN_SELLING_WINDOW before drawingTime.
     /// @param name           Display name; emitted only.
-    function createPool(uint256 drawingId, uint256 totalShares, uint64 salesCloseTime, string calldata name)
-        external
-        whenNotPaused
-    {
+    function createPool(
+        uint256 drawingId,
+        uint256 totalShares,
+        uint256 reserveBps,
+        uint64 salesCloseTime,
+        string calldata name
+    ) external whenNotPaused {
         if (totalShares == 0 || totalShares > MAX_TOTAL_SHARES) revert InvalidShares();
+        // Reserve must leave at least one share to sell; 100%+ is not a pool. (reserveBps strictly
+        // below 100% guarantees sharesForSale >= 1, since floor(totalShares*reserveBps/BPS) < totalShares.)
+        if (reserveBps >= BPS_DENOMINATOR) revert InvalidReserve();
 
         Pool storage p = pools[_key(msg.sender, drawingId)];
         if (p.state != State.None) revert PoolExists();
@@ -264,11 +278,12 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         p.organizer = msg.sender;
         p.drawingId = drawingId;
         p.totalShares = totalShares;
+        p.reserveBps = reserveBps;
         p.salesCloseTime = salesCloseTime;
         p.state = State.Building;
 
         history[msg.sender].push(drawingId);
-        emit PoolCreated(msg.sender, drawingId, totalShares, salesCloseTime, name);
+        emit PoolCreated(msg.sender, drawingId, totalShares, reserveBps, salesCloseTime, name);
     }
 
     /// @notice Buy `tickets` explicit-pick Megapot tickets (1..10) and add them to the pool.
@@ -336,41 +351,27 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     // Lock: freeze the ticket set, fix the price, go live
     // -----------------------------------------------------------------------
 
-    /// @notice Organizer locks the pool: ticket set frozen, pricePerShare fixed, autoStake
-    ///         granted, and the pool goes Live so players can buy shares. Requires >= 1 ticket.
+    /// @notice Organizer locks the pool: ticket set frozen, pricePerShare fixed, the chosen
+    ///         reserve carved out, and the pool goes Live so players can buy. Requires >= 1 ticket.
     function lock(uint256 drawingId) external whenNotPaused {
         Pool storage p = _pool(msg.sender, drawingId);
         if (p.state != State.Building) revert WrongState();
         if (p.ticketCount == 0) revert NoTickets();
         _goLive(p);
-        emit PoolLocked(msg.sender, drawingId, p.ticketFunding, p.pricePerShare, p.sharesForSale, p.autoStakeShares);
+        emit PoolLocked(msg.sender, drawingId, p.ticketFunding, p.pricePerShare, p.sharesForSale, p.reserveShares);
     }
 
-    /// @dev Building -> Live: compute autoStake / sharesForSale / pricePerShare and grant autoStake.
-    ///      The value the organizer set as totalShares at creation is the player-facing
-    ///      for-sale supply. The auto-stake is minted ON TOP of it, so the organizer's
-    ///      reimbursement is funded entirely by the for-sale shares (a full sellout returns the
-    ///      full ticketFunding), while the organizer still retains a 2.5% stake.
+    /// @dev Building -> Live: carve the organizer's chosen reserve out of totalShares and put the
+    ///      rest up for sale. Price still divides by totalShares, so the organizer is reimbursed
+    ///      only on the shares that sell — the foregone reimbursement on the reserved shares is the
+    ///      (intended) cost of the stake they chose to keep off the market.
     function _goLive(Pool storage p) internal {
-        uint256 forSale = p.totalShares;
-
-        // 2.5% of the FINAL total (forSale + autoStake), so the denominator is
-        // BPS_DENOMINATOR - AUTO_STAKE_BPS (9750): autoStake / (forSale + autoStake) == 250/10000.
-        uint256 autoStake = (forSale * AUTO_STAKE_BPS) / (BPS_DENOMINATOR - AUTO_STAKE_BPS);
-
-        p.sharesForSale = forSale;
-        p.autoStakeShares = autoStake;
-        p.totalShares = forSale + autoStake;
-
-        // Price divides by sharesForSale (not totalShares) and rounds UP: the for-sale shares
-        // alone must return at least the full ticketFunding on a sellout, so the organizer is
-        // reimbursed everything they fronted (never short), and every credited cent is backed
-        // by a buyer's payment. Rounding down and crediting the remainder would credit unbacked
-        // USDC and break the cross-pool solvency invariant; rounding up keeps it whole and solvent
-        // (a sellout reimburses ticketFunding plus at most forSale-1 micro-USDC, paid by buyers).
-        p.pricePerShare = (p.ticketFunding + forSale - 1) / forSale;
-
-        if (autoStake > 0) _addShares(p, p.organizer, autoStake);
+        uint256 reserveShares = (p.totalShares * p.reserveBps) / BPS_DENOMINATOR;
+        p.reserveShares = reserveShares;
+        p.sharesForSale = p.totalShares - reserveShares;
+        if (p.sharesForSale == 0) revert InvalidReserve(); // nothing left to sell (defensive)
+        p.pricePerShare = p.ticketFunding / p.totalShares;
+        if (reserveShares > 0) _addShares(p, p.organizer, reserveShares);
         p.state = State.Live;
     }
 
@@ -616,7 +617,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
             uint256 totalShares,
             uint256 sharesForSale,
             uint256 sharesSold,
-            uint256 autoStakeShares,
+            uint256 reserveShares,
             uint256 ticketCount,
             uint64 salesCloseTime,
             uint256 pricePerShare,
@@ -632,7 +633,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
             p.totalShares,
             p.sharesForSale,
             p.sharesSold,
-            p.autoStakeShares,
+            p.reserveShares,
             p.ticketCount,
             p.salesCloseTime,
             p.pricePerShare,

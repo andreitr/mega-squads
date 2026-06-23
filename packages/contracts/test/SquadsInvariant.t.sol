@@ -51,14 +51,15 @@ contract SquadsHandler is Test {
         }
     }
 
-    function createPool(uint256 orgSeed, uint256 shares) public {
+    function createPool(uint256 orgSeed, uint256 shares, uint256 reserveBps) public {
         address org = _actor(orgSeed);
         uint256 draw = jackpot.currentDrawingId();
         if (squads.poolExists(org, draw)) return;
         shares = bound(shares, 1, 200);
+        reserveBps = bound(reserveBps, 0, 9_900); // 0..99%, exercises the carve-out at all levels
         uint64 close = uint64(block.timestamp + 23 hours);
         vm.prank(org);
-        try squads.createPool(draw, shares, close, "h") {
+        try squads.createPool(draw, shares, reserveBps, close, "h") {
             refs.push(Ref(org, draw));
         } catch {}
     }
