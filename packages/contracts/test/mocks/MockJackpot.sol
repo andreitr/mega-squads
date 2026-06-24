@@ -32,6 +32,10 @@ contract MockJackpot {
     /// @notice Per-purchase referral fee rate, 1e18 scale (e.g. 0.1e18 = 10%). Settable.
     uint256 public referralFeeRate;
 
+    /// @notice Win-share referral rate, 1e18 scale (referrer share = winnings * rate / 1e18).
+    ///         Default 0; tests set it and simulate the win-share accrual via accrueReferral().
+    uint256 public winShareRate;
+
     struct DrawingData {
         uint256 drawingTime;
         uint256 winningTicket; // 0 until settled
@@ -155,7 +159,7 @@ contract MockJackpot {
             prizePool: 0,
             ticketPrice: ticketPrice,
             edgePerTicket: 0,
-            referralWinShare: 0,
+            referralWinShare: winShareRate,
             referralFee: referralFeeRate,
             globalTicketsBought: 0,
             lpEarnings: 0,
@@ -187,6 +191,11 @@ contract MockJackpot {
     /// @notice Override the per-purchase referral fee rate (1e18 scale).
     function setReferralFeeRate(uint256 rate) external {
         referralFeeRate = rate;
+    }
+
+    /// @notice Set the win-share referral rate (1e18 scale).
+    function setWinShareRate(uint256 rate) external {
+        winShareRate = rate;
     }
 
     /// @notice Mark a ticket as landing in a specific prize tier (0-11) BEFORE settlement.

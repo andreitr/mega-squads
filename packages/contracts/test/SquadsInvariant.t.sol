@@ -106,6 +106,15 @@ contract SquadsHandler is Test {
         vm.prank(_actor(actorSeed));
         try squads.withdraw(r.org, r.draw) {} catch {}
     }
+
+    /// @dev Simulate a win-share accruing to Squads' aggregate referral balance (funded), so a
+    ///      later buy/claim sweeps it into the unattributed bucket — stressing the solvency
+    ///      invariant's unattributedFees term under interleaved buys and settlements.
+    function accrueStrayReferral(uint256 amt) public {
+        amt = bound(amt, 1, 5_000_000); // up to 5 USDC
+        usdc.mint(address(jackpot), amt);
+        jackpot.accrueReferral(address(squads), amt);
+    }
 }
 
 contract SquadsInvariantTest is Test {

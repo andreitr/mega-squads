@@ -42,11 +42,12 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *         identical logic, so pools are rows in a mapping keyed by (organizer,
  *         drawingId) rather than separate deployments. The trade-off is that every
  *         pool shares this contract's USDC balance, so accounting must be airtight.
- *         Two running counters — `totalClaimable` (USDC owed to holders) and
- *         `totalFeesLocked` (referral fees swept but not yet released) — make the
- *         cross-pool solvency invariant a single check:
+ *         Three running counters — `totalClaimable` (USDC owed to holders),
+ *         `totalFeesLocked` (referral fees swept and attributed but not yet released), and
+ *         `unattributedFees` (referral USDC swept from Megapot's aggregate but not yet drawn by
+ *         a pool) — make the cross-pool solvency invariant a single check:
  *
- *             totalClaimable + totalFeesLocked <= USDC.balanceOf(this)
+ *             totalClaimable + totalFeesLocked + unattributedFees <= USDC.balanceOf(this)
  *
  *         RELATION TO PENNYPOT. The Megapot-facing pieces are copied from PennyPot
  *         (`andreitr/pennypot`): the IJackpot / IRandomTicketBuyer interfaces, the
@@ -97,6 +98,11 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     /// @notice Single-referrer weight passed to Megapot. The split is 1e18-scale and must
     ///         sum to exactly 1e18, so one 100% referrer uses the full weight.
     uint256 internal constant REFERRAL_SPLIT_FULL = 1e18;
+
+    /// @notice Scale of Megapot's referral rate fields (`referralFee`, `referralWinShare`) on
+    ///         getDrawingState — 1e18 (e.g. 0.10e18 = 10%). Confirmed against
+    ///         https://llms.megapot.io/tasks/claim-referral-fees.
+    uint256 internal constant RATE_SCALE = 1e18;
 
     /// @notice Integration source tag for Megapot analytics (keccak256 of the app name).
     bytes32 public constant SOURCE = keccak256("squads");
@@ -155,8 +161,16 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     /// @notice Sum of every pool's outstanding `claimable`. Half of the solvency invariant.
     uint256 public totalClaimable;
 
-    /// @notice Sum of every pool's swept-but-unreleased referral fees. Other half of the invariant.
+    /// @notice Sum of every pool's swept-but-unreleased referral fees. Part of the invariant.
     uint256 public totalFeesLocked;
+
+    /// @notice Referral USDC claimed from Megapot's single aggregate balance but not yet
+    ///         attributed to a pool. Win-share referral accrues to the aggregate asynchronously,
+    ///         so a concurrent buy may sweep a settling pool's win-share before that pool settles;
+    ///         it lands here and the owed pool draws its entitlement on settlement, instead of
+    ///         being misattributed to the buyer. Real USDC in the contract, so it is part of the
+    ///         solvency invariant.
+    uint256 public unattributedFees;
 
     // -----------------------------------------------------------------------
     // Events
@@ -217,6 +231,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     error TicketsAlreadyBought();
     error ZeroAmount();
     error NothingToWithdraw();
+    error Insolvent();
 
     // -----------------------------------------------------------------------
     // Constructor
@@ -343,8 +358,8 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     function _afterTicketBuy(Pool storage p, uint256 drawingId, uint256 count, uint256 cost) internal {
         p.ticketCount += count;
         p.ticketFunding += cost;
-        uint256 swept = _sweepReferralFees(p);
-        emit TicketsAdded(p.organizer, drawingId, count, p.ticketCount, swept);
+        uint256 collected = _collectSalesFee(p, cost);
+        emit TicketsAdded(p.organizer, drawingId, count, p.ticketCount, collected);
     }
 
     // -----------------------------------------------------------------------
@@ -457,8 +472,10 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         // 3. Winnings pro rata by totalShares; rounding dust to the organizer.
         if (totalWin > 0) _distributePro(p, organizer, totalWin);
 
-        // 4. Sweep any win-share referral, then release ALL locked fees by the sold-out rule.
-        _sweepReferralFees(p);
+        // 4. Collect this pool's win-share referral entitlement, then release ALL locked fees
+        //    by the sold-out rule. _collectWinShare draws from the shared bucket, so a settling
+        //    pool always gets its win-share even if a concurrent buy already swept it.
+        _collectWinShare(p, totalWin);
         uint256 fees = p.feesCollected;
         if (fees > 0) {
             p.feesCollected = 0;
@@ -555,6 +572,21 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         _unpause();
     }
 
+    /// @notice Janitorial backstop: transfer residual unattributed referral USDC out (e.g. the
+    ///         rounding residue left in the shared bucket after every pool in a drawing has
+    ///         settled and drawn its win-share). Only ever moves `unattributedFees` — which is
+    ///         counted in the solvency invariant — so holder winnings, rebates, and locked fees
+    ///         can never be touched, and `_requireSolvent` confirms the invariant still holds.
+    ///         Not a normal path; use only once the relevant pools have collected their share.
+    function sweepUnattributed(address to) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        uint256 amount = unattributedFees;
+        if (amount == 0) revert NothingToWithdraw();
+        unattributedFees = 0;
+        USDC.safeTransfer(to, amount);
+        _requireSolvent();
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -591,16 +623,57 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         totalClaimable += amount;
     }
 
-    /// @dev Claim Squads' accrued Megapot referral fees into this pool's locked fee balance.
-    ///      Guards the zero case (Megapot's claimReferralFees reverts on a zero balance) and
-    ///      measures the real USDC delta, so the locked amount can never exceed what was paid.
-    function _sweepReferralFees(Pool storage p) internal returns (uint256 swept) {
-        if (JACKPOT.referralFees(address(this)) == 0) return 0;
+    /// @dev Claim Squads' ENTIRE aggregate Megapot referral balance into the shared
+    ///      `unattributedFees` bucket. Megapot keeps one referral balance for the contract across
+    ///      all pools, so a sweep is never pool-specific — attribution happens in
+    ///      `_drawFromUnattributed`. Guards the zero case (claimReferralFees reverts on zero).
+    function _sweepToUnattributed() internal {
+        if (JACKPOT.referralFees(address(this)) == 0) return;
         uint256 before = USDC.balanceOf(address(this));
         JACKPOT.claimReferralFees();
-        swept = USDC.balanceOf(address(this)) - before;
-        p.feesCollected += swept;
-        totalFeesLocked += swept;
+        unattributedFees += USDC.balanceOf(address(this)) - before;
+    }
+
+    /// @dev Move up to `owed` USDC from the shared bucket into pool `p`'s locked fees. Clamped to
+    ///      the available bucket so it can never over-attribute.
+    function _drawFromUnattributed(Pool storage p, uint256 owed) internal returns (uint256 taken) {
+        taken = owed < unattributedFees ? owed : unattributedFees;
+        if (taken > 0) {
+            unattributedFees -= taken;
+            p.feesCollected += taken;
+            totalFeesLocked += taken;
+        }
+    }
+
+    /// @dev Sales-side referral, collected in the SAME tx as the buy. Megapot accrues
+    ///      `ticketCost * referralFee / 1e18` on a purchase; we sweep the aggregate into the
+    ///      shared bucket and draw exactly that entitlement. Drawing only the analytic amount
+    ///      (rather than the whole swept delta) is what stops a concurrent buy from capturing
+    ///      another pool's pending win-share — that win-share is left in the bucket for its pool.
+    function _collectSalesFee(Pool storage p, uint256 ticketCost) internal returns (uint256) {
+        _sweepToUnattributed();
+        uint256 owed = (ticketCost * JACKPOT.getDrawingState(p.drawingId).referralFee) / RATE_SCALE;
+        return _drawFromUnattributed(p, owed);
+    }
+
+    /// @dev Win-share referral, collected at settlement. The win-share accrues to the aggregate
+    ///      asynchronously and may already have been swept into the bucket by another pool's buy,
+    ///      so we sweep any fresh balance and then draw THIS pool's entitlement from the bucket
+    ///      regardless of who swept it (stranded-fee safety). Entitlement is
+    ///      `totalWin * referralWinShare / 1e18` — Squads is the 100% referrer, and the win-share
+    ///      rate is confirmed against https://llms.megapot.io/tasks/claim-referral-fees
+    ///      (referralWinShare, 1e18 scale; referrer share = claimedWinnings * referralWinShare).
+    function _collectWinShare(Pool storage p, uint256 totalWin) internal {
+        _sweepToUnattributed();
+        uint256 owed = (totalWin * JACKPOT.getDrawingState(p.drawingId).referralWinShare) / RATE_SCALE;
+        _drawFromUnattributed(p, owed);
+    }
+
+    /// @dev Revert unless tracked liabilities are fully backed by the USDC balance.
+    function _requireSolvent() internal view {
+        if (totalClaimable + totalFeesLocked + unattributedFees > USDC.balanceOf(address(this))) {
+            revert Insolvent();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -692,6 +765,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     /// @notice The cross-pool solvency check: true iff outstanding liabilities are fully
     ///         backed by the contract's USDC balance. Should always hold.
     function isSolvent() external view returns (bool) {
-        return totalClaimable + totalFeesLocked <= USDC.balanceOf(address(this));
+        return totalClaimable + totalFeesLocked + unattributedFees <= USDC.balanceOf(address(this));
     }
 }

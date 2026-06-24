@@ -125,6 +125,13 @@ contract SquadsTest is Test {
         }
     }
 
+    /// @dev Simulate Megapot accruing `amount` of referral win-share to Squads' aggregate
+    ///      balance (funding the Jackpot to cover the later claim).
+    function _accrueWinShare(uint256 amount) internal {
+        usdc.mint(address(jackpot), amount);
+        jackpot.accrueReferral(address(squads), amount);
+    }
+
     // ---------------------------------------------------------------------
     // createPool
     // ---------------------------------------------------------------------
@@ -819,5 +826,144 @@ contract SquadsTest is Test {
         // (reserveBps < 100% guarantees sharesForSale >= 1, so truncation-to-0 can't occur).
         _createPool(organizer, 1, 9_999);
         assertTrue(squads.poolExists(organizer, drawingId));
+    }
+
+    // ---------------------------------------------------------------------
+    // Win-share referral attribution (Megapot's single aggregate balance)
+    // ---------------------------------------------------------------------
+
+    function test_SalesFeeStillAtomicAndCorrect() public {
+        // No win-share configured: the sales fee is collected atomically at buy time and fully
+        // attributed to the pool, with nothing left in the shared bucket.
+        _createPool(organizer, 100);
+        _addTickets(organizer, 5);
+
+        (,,,,,,,,,,, uint256 feesCollected) = squads.getPool(organizer, drawingId);
+        uint256 salesFee = (5 * TICKET_PRICE * FEE_RATE) / 1e18; // 500_000
+        assertEq(feesCollected, salesFee);
+        assertEq(squads.totalFeesLocked(), salesFee);
+        assertEq(squads.unattributedFees(), 0);
+        _assertSolvent();
+    }
+
+    function test_WinShareWhenNoConcurrentSweep() public {
+        jackpot.setWinShareRate(0.1e18); // 10% win-share referral
+        _createPool(organizer, 100);
+        _addTickets(organizer, 5);
+        _lock(organizer);
+        _buy(alice, organizer, 98); // sold out
+
+        _settle();
+        uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
+        uint256 prize = 100 * TICKET_PRICE;
+        _setWinner(ids[0], 1, prize);
+        uint256 winShare = (prize * 0.1e18) / 1e18; // 10 USDC, accrues to Squads' aggregate
+        _accrueWinShare(winShare);
+
+        squads.claimAndDistribute(organizer, drawingId);
+
+        // The pool collected its win-share; nothing stranded in the bucket.
+        assertEq(squads.unattributedFees(), 0);
+
+        // Sold out -> total fees (sales + win-share) rebated pro rata; alice holds 98/100.
+        uint256 salesFee = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
+        uint256 totalFees = salesFee + winShare;
+        uint256 aliceWin = (prize * 98) / 100;
+        uint256 aliceFeeShare = (totalFees * 98) / 100;
+        assertEq(squads.claimableOf(organizer, drawingId, alice), aliceWin + aliceFeeShare);
+        _assertSolvent();
+    }
+
+    function test_WinShareAttributedToSettlingPoolUnderConcurrency() public {
+        jackpot.setWinShareRate(0.1e18); // 10%
+        address orgA = organizer;
+        address orgB = address(0xB0B0);
+        _fund(orgB, 1_000 * TICKET_PRICE);
+
+        // Pool A in drawing 1: build, lock, sell out.
+        _createPool(orgA, 100);
+        _addTickets(orgA, 5);
+        _lock(orgA);
+        _buy(alice, orgA, 98);
+
+        // Settle drawing 1; A's ticket wins, and A's win-share accrues to the aggregate at
+        // settlement (the worst-case timing the fix must tolerate).
+        _settle(); // currentDrawingId -> 2
+        uint256[] memory idsA = squads.getTicketIds(orgA, drawingId);
+        uint256 prize = 100 * TICKET_PRICE;
+        _setWinner(idsA[0], 1, prize);
+        uint256 winShareA = (prize * 0.1e18) / 1e18; // 10 USDC
+        _accrueWinShare(winShareA);
+
+        // CONCURRENCY: pool B (next drawing) buys tickets BEFORE A settles. B's buy sweeps the
+        // aggregate — including A's pending win-share — but draws only B's own sales fee.
+        uint256 drawB = jackpot.currentDrawingId(); // 2
+        vm.prank(orgB);
+        squads.createPool(drawB, 100, DEFAULT_RESERVE_BPS, _closeTime(), "B");
+        vm.prank(orgB);
+        squads.addTickets(drawB, _picks(3));
+
+        // B did NOT capture A's win-share: B's locked fees are only its own 3-ticket sales fee,
+        // and A's win-share sits parked in the shared bucket.
+        uint256 bSalesFee = (3 * TICKET_PRICE * FEE_RATE) / 1e18; // 300_000
+        (,,,,,,,,,,, uint256 bFees) = squads.getPool(orgB, drawB);
+        assertEq(bFees, bSalesFee);
+        assertEq(squads.unattributedFees(), winShareA);
+
+        // Now A settles and collects ITS win-share from the bucket.
+        squads.claimAndDistribute(orgA, drawingId);
+        assertEq(squads.unattributedFees(), 0);
+
+        // A's holders received A's win-share (sold-out rebate); alice holds 98/100 of A.
+        uint256 aSalesFee = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
+        uint256 aliceWin = (prize * 98) / 100;
+        uint256 aliceFeeShare = ((aSalesFee + winShareA) * 98) / 100;
+        assertEq(squads.claimableOf(orgA, drawingId, alice), aliceWin + aliceFeeShare);
+
+        // B still has only its own sales fee — it never received A's win-share.
+        (,,,,,,,,,,, uint256 bFeesAfter) = squads.getPool(orgB, drawB);
+        assertEq(bFeesAfter, bSalesFee);
+        _assertSolvent();
+    }
+
+    function test_SweepUnattributedOnlyTransfersSurplus() public {
+        _createPool(organizer, 100);
+        _addTickets(organizer, 5);
+
+        // A stray win-share enters the aggregate (e.g. another pool's pending share), then a buy
+        // sweeps it into the bucket but draws only its own sales fee, leaving the stray parked.
+        uint256 stray = 7 * TICKET_PRICE;
+        _accrueWinShare(stray);
+        _addTickets(organizer, 2);
+        assertEq(squads.unattributedFees(), stray);
+        _assertSolvent();
+
+        _lock(organizer);
+        _buy(alice, organizer, 98); // sold out
+        _settle();
+        squads.claimAndDistribute(organizer, drawingId); // losing; fees rebated to holders
+
+        uint256 aliceOwed = squads.claimableOf(organizer, drawingId, alice);
+        assertGt(aliceOwed, 0);
+        assertEq(squads.unattributedFees(), stray); // pool drew no win-share; stray still parked
+
+        // Non-owner cannot sweep.
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        squads.sweepUnattributed(stranger);
+
+        // Owner sweeps ONLY the unattributed residue; holder funds are untouched.
+        vm.prank(admin);
+        squads.sweepUnattributed(admin);
+        assertEq(squads.unattributedFees(), 0);
+        assertEq(usdc.balanceOf(admin), stray);
+        _assertSolvent();
+
+        // alice can still withdraw her full claimable — the sweep could not reach it.
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        squads.withdraw(organizer, drawingId);
+        assertEq(usdc.balanceOf(alice), aliceBefore + aliceOwed);
+        _assertSolvent();
     }
 }
