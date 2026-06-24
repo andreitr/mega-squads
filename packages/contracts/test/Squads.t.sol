@@ -16,6 +16,11 @@ contract SquadsTest is Test {
     uint256 internal constant FEE_RATE = 0.1e18; // 10% referral fee (mock default)
     uint256 internal constant DEFAULT_RESERVE_BPS = 250; // UI default reserve (2.5%)
 
+    // Mirror of the contract's fixed share supply (Squads.TOTAL_SHARES).
+    uint256 internal constant TOTAL_SHARES = 1000;
+    // For the default reserve: reserveShares = 1000 * 250 / 10000 = 25, so 975 are for sale.
+    uint256 internal constant DEFAULT_FOR_SALE = 975;
+
     Squads internal squads;
     MockUSDC internal usdc;
     MockJackpot internal jackpot;
@@ -31,14 +36,7 @@ contract SquadsTest is Test {
     uint256 internal drawingId; // the open drawing pools are created for (1)
 
     // Mirror of Squads.PoolCreated for vm.expectEmit.
-    event PoolCreated(
-        address indexed organizer,
-        uint256 indexed drawingId,
-        uint256 totalShares,
-        uint256 reserveBps,
-        uint64 salesCloseTime,
-        string name
-    );
+    event PoolCreated(address indexed organizer, uint256 indexed drawingId, uint256 reserveBps, string name);
 
     function setUp() public {
         vm.warp(1_700_000_000); // realistic timestamp so drawingTime math never underflows
@@ -83,17 +81,14 @@ contract SquadsTest is Test {
         }
     }
 
-    function _closeTime() internal view returns (uint64) {
-        return uint64(block.timestamp + 23 hours); // leaves exactly the 1h selling window
+    /// @dev Create a pool buying `ticketCount` initial tickets (default reserve).
+    function _createPool(address org, uint256 ticketCount) internal {
+        _createPool(org, ticketCount, DEFAULT_RESERVE_BPS);
     }
 
-    function _createPool(address org, uint256 totalShares) internal {
-        _createPool(org, totalShares, DEFAULT_RESERVE_BPS);
-    }
-
-    function _createPool(address org, uint256 totalShares, uint256 reserveBps) internal {
+    function _createPool(address org, uint256 ticketCount, uint256 reserveBps) internal {
         vm.prank(org);
-        squads.createPool(drawingId, totalShares, reserveBps, _closeTime(), "My Squad");
+        squads.createPool(drawingId, ticketCount, reserveBps, "My Squad");
     }
 
     function _addTickets(address org, uint256 n) internal {
@@ -151,17 +146,59 @@ contract SquadsTest is Test {
         return string(b);
     }
 
+    // ---- getPool field accessors (one destructure per field, drawingId-scoped) ----
+
+    function _state(address org) internal view returns (Squads.State v) {
+        (v,,,,,,,,,,) = squads.getPool(org, drawingId);
+    }
+
+    function _soldOut(address org) internal view returns (bool v) {
+        (, v,,,,,,,,,) = squads.getPool(org, drawingId);
+    }
+
+    function _totalShares(address org) internal view returns (uint256 v) {
+        (,, v,,,,,,,,) = squads.getPool(org, drawingId);
+    }
+
+    function _sharesForSale(address org) internal view returns (uint256 v) {
+        (,,, v,,,,,,,) = squads.getPool(org, drawingId);
+    }
+
+    function _reserveShares(address org) internal view returns (uint256 v) {
+        (,,,,, v,,,,,) = squads.getPool(org, drawingId);
+    }
+
+    function _ticketCount(address org) internal view returns (uint256 v) {
+        (,,,,,, v,,,,) = squads.getPool(org, drawingId);
+    }
+
+    function _pricePerShare(address org) internal view returns (uint256 v) {
+        (,,,,,,, v,,,) = squads.getPool(org, drawingId);
+    }
+
+    function _ticketFunding(address org) internal view returns (uint256 v) {
+        (,,,,,,,, v,,) = squads.getPool(org, drawingId);
+    }
+
+    function _totalWinnings(address org) internal view returns (uint256 v) {
+        (,,,,,,,,, v,) = squads.getPool(org, drawingId);
+    }
+
+    function _feesCollected(address org, uint256 draw) internal view returns (uint256 v) {
+        (,,,,,,,,,, v) = squads.getPool(org, draw);
+    }
+
+    function _feesCollected(address org) internal view returns (uint256) {
+        return _feesCollected(org, drawingId);
+    }
+
     // ---------------------------------------------------------------------
-    // createPool
+    // createPool (atomic create + buy)
     // ---------------------------------------------------------------------
 
     function test_CreatePool() public {
-        _createPool(organizer, 100);
-
-        (Squads.State state,, uint256 totalShares,,,,, uint64 closeTime,,,,) = squads.getPool(organizer, drawingId);
-        assertEq(uint256(state), uint256(Squads.State.Building));
-        assertEq(totalShares, 100);
-        assertEq(closeTime, _closeTime());
+        _createPool(organizer, 5);
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Building));
         assertTrue(squads.poolExists(organizer, drawingId));
 
         uint256[] memory h = squads.getHistory(organizer);
@@ -170,42 +207,51 @@ contract SquadsTest is Test {
         _assertSolvent();
     }
 
+    function test_CreatePoolBuysTicketsAtomically() public {
+        _createPool(organizer, 5); // no separate addTickets needed
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Building));
+        assertEq(_ticketCount(organizer), 5);
+        assertEq(_ticketFunding(organizer), 5 * TICKET_PRICE);
+        assertEq(squads.getTicketIds(organizer, drawingId).length, 5);
+        // Sales fee collected atomically with the buy.
+        assertEq(_feesCollected(organizer), (5 * TICKET_PRICE * FEE_RATE) / 1e18);
+        _assertSolvent();
+    }
+
+    function test_CreatePoolRevertsOnZeroTickets() public {
+        vm.prank(organizer);
+        vm.expectRevert(Squads.NoTickets.selector);
+        squads.createPool(drawingId, 0, DEFAULT_RESERVE_BPS, "empty");
+    }
+
+    function test_CreatePoolRevertsOverTicketCap() public {
+        vm.prank(organizer);
+        vm.expectRevert(Squads.TooManyTickets.selector); // MAX_POOL_TICKETS = 100
+        squads.createPool(drawingId, 101, DEFAULT_RESERVE_BPS, "huge");
+    }
+
     function test_CreatePool_revertsOnDuplicate() public {
-        _createPool(organizer, 100);
+        _createPool(organizer, 5);
         vm.prank(organizer);
         vm.expectRevert(Squads.PoolExists.selector);
-        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), "dup");
-    }
-
-    function test_CreatePool_revertsOnTightWindow() public {
-        // salesCloseTime only 30 min before drawingTime < MIN_SELLING_WINDOW (1h)
-        uint64 tooLate = uint64(block.timestamp + DRAW_DURATION - 30 minutes);
-        vm.prank(organizer);
-        vm.expectRevert(Squads.SellingWindowTooTight.selector);
-        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, tooLate, "tight");
-    }
-
-    function test_CreatePool_revertsOnPastCloseTime() public {
-        vm.prank(organizer);
-        vm.expectRevert(Squads.SalesClosed.selector);
-        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, uint64(block.timestamp), "past");
+        squads.createPool(drawingId, 5, DEFAULT_RESERVE_BPS, "dup");
     }
 
     function test_CreatePool_revertsOnWrongDrawing() public {
         vm.prank(organizer);
         vm.expectRevert(Squads.DrawingNotOpen.selector);
-        squads.createPool(drawingId + 5, 100, DEFAULT_RESERVE_BPS, _closeTime(), "wrong");
+        squads.createPool(drawingId + 5, 5, DEFAULT_RESERVE_BPS, "wrong");
     }
 
-    function test_CreatePool_revertsOnInvalidShares() public {
-        vm.prank(organizer);
-        vm.expectRevert(Squads.InvalidShares.selector);
-        squads.createPool(drawingId, 0, DEFAULT_RESERVE_BPS, _closeTime(), "zero");
+    function test_TotalSharesIsFixed() public {
+        // Whatever the organizer does, totalShares is the fixed TOTAL_SHARES constant.
+        _createPool(organizer, 5);
+        assertEq(_totalShares(organizer), TOTAL_SHARES);
 
-        uint256 tooMany = squads.MAX_TOTAL_SHARES() + 1; // read before arming expectRevert
-        vm.prank(organizer);
-        vm.expectRevert(Squads.InvalidShares.selector);
-        squads.createPool(drawingId, tooMany, DEFAULT_RESERVE_BPS, _closeTime(), "huge");
+        address org2 = address(0xD00D);
+        _fund(org2, 100 * TICKET_PRICE);
+        _createPool(org2, 50, 5_000); // different ticket count + reserve
+        assertEq(_totalShares(org2), TOTAL_SHARES);
     }
 
     // ---------------------------------------------------------------------
@@ -213,17 +259,16 @@ contract SquadsTest is Test {
     // ---------------------------------------------------------------------
 
     function test_CreatePoolAcceptsNormalName() public {
-        uint64 close = _closeTime();
         vm.expectEmit(true, true, false, true, address(squads));
-        emit PoolCreated(organizer, drawingId, 100, DEFAULT_RESERVE_BPS, close, "Friday Degens");
+        emit PoolCreated(organizer, drawingId, DEFAULT_RESERVE_BPS, "Friday Degens");
         vm.prank(organizer);
-        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, close, "Friday Degens");
+        squads.createPool(drawingId, 5, DEFAULT_RESERVE_BPS, "Friday Degens");
         assertTrue(squads.poolExists(organizer, drawingId));
     }
 
     function test_CreatePoolAcceptsEmptyName() public {
         vm.prank(organizer);
-        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), ""); // frontend supplies a default
+        squads.createPool(drawingId, 5, DEFAULT_RESERVE_BPS, ""); // frontend supplies a default
         assertTrue(squads.poolExists(organizer, drawingId));
     }
 
@@ -231,7 +276,7 @@ contract SquadsTest is Test {
         string memory name = _nameOfBytes(64); // exactly MAX_NAME_BYTES
         assertEq(bytes(name).length, 64);
         vm.prank(organizer);
-        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), name);
+        squads.createPool(drawingId, 5, DEFAULT_RESERVE_BPS, name);
         assertTrue(squads.poolExists(organizer, drawingId));
     }
 
@@ -239,74 +284,57 @@ contract SquadsTest is Test {
         string memory name = _nameOfBytes(65); // MAX_NAME_BYTES + 1
         vm.prank(organizer);
         vm.expectRevert(Squads.NameTooLong.selector);
-        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), name);
+        squads.createPool(drawingId, 5, DEFAULT_RESERVE_BPS, name);
     }
 
     function test_CreatePoolNameNotInStorage() public {
         // The name is display metadata only: emitted in PoolCreated, never written to the Pool
-        // struct. getPool()'s return tuple is all scalars — there is no name field to read. (If a
-        // name had been stored, the tuple would include it and this 12-field destructuring would
-        // not compile.) Confirms the name costs no storage slot.
+        // struct. getPool()'s return tuple is all scalars — there is no name field to read.
+        _createPool(organizer, 5);
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Building));
+        assertEq(_totalShares(organizer), TOTAL_SHARES);
+        assertFalse(_soldOut(organizer));
+    }
+
+    // ---------------------------------------------------------------------
+    // addTickets / addRandomTickets (grow during Building)
+    // ---------------------------------------------------------------------
+
+    function test_AddTicketsStillGrowsPoolDuringBuilding() public {
+        _createPool(organizer, 5); // starts with 5
+        _addTickets(organizer, 10);
+        _addTickets(organizer, 10);
+        _addTickets(organizer, 5); // 5 + 25 = 30 total
+        assertEq(_ticketCount(organizer), 30);
+        assertEq(_ticketFunding(organizer), 30 * TICKET_PRICE);
+
+        // Once locked, no more tickets can be added.
+        _lock(organizer);
         vm.prank(organizer);
-        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), "a stored name would waste a slot");
-
-        (Squads.State state, bool soldOut, uint256 totalShares,,,,,,,,,) = squads.getPool(organizer, drawingId);
-        assertEq(uint256(state), uint256(Squads.State.Building));
-        assertEq(totalShares, 100);
-        assertFalse(soldOut);
-    }
-
-    // ---------------------------------------------------------------------
-    // addTickets / addRandomTickets
-    // ---------------------------------------------------------------------
-
-    function test_AddTickets() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
-
-        (,,,,,, uint256 ticketCount,,, uint256 ticketFunding,, uint256 feesCollected) =
-            squads.getPool(organizer, drawingId);
-        assertEq(ticketCount, 5);
-        assertEq(ticketFunding, 5 * TICKET_PRICE);
-        // 10% referral fee on a 5-USDC purchase = 0.5 USDC, swept and locked in the pool.
-        assertEq(feesCollected, (5 * TICKET_PRICE * FEE_RATE) / 1e18);
-        assertEq(squads.totalFeesLocked(), feesCollected);
-        assertEq(squads.getTicketIds(organizer, drawingId).length, 5);
-        _assertSolvent();
-    }
-
-    function test_AddTickets_accumulatesAcrossCalls() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 6);
-        _addTickets(organizer, 4);
-        (,,,,,, uint256 ticketCount,,, uint256 ticketFunding,,) = squads.getPool(organizer, drawingId);
-        assertEq(ticketCount, 10);
-        assertEq(ticketFunding, 10 * TICKET_PRICE);
-        _assertSolvent();
+        vm.expectRevert(Squads.WrongState.selector);
+        squads.addTickets(drawingId, _picks(1));
     }
 
     function test_AddRandomTickets() public {
-        _createPool(organizer, 100);
+        _createPool(organizer, 5);
         vm.prank(organizer);
         squads.addRandomTickets(drawingId, 3);
-        (,,,,,, uint256 ticketCount,,,,, uint256 feesCollected) = squads.getPool(organizer, drawingId);
-        assertEq(ticketCount, 3);
-        assertEq(feesCollected, (3 * TICKET_PRICE * FEE_RATE) / 1e18);
+        assertEq(_ticketCount(organizer), 8);
+        assertEq(_feesCollected(organizer), (8 * TICKET_PRICE * FEE_RATE) / 1e18);
         _assertSolvent();
     }
 
     function test_AddTickets_revertsOverBatch() public {
-        _createPool(organizer, 100);
+        _createPool(organizer, 5);
         vm.prank(organizer);
         vm.expectRevert(Squads.InvalidTicketCount.selector);
         squads.addTickets(drawingId, _picks(11));
     }
 
     function test_AddTickets_revertsOverPoolCap() public {
-        _createPool(organizer, 100);
-        // MAX_POOL_TICKETS = 100; add 100 in 10 calls, then the 101st reverts.
-        for (uint256 i = 0; i < 10; i++) {
-            _addTickets(organizer, 10);
+        _createPool(organizer, 10); // 10
+        for (uint256 i = 0; i < 9; i++) {
+            _addTickets(organizer, 10); // +90 -> 100 (MAX_POOL_TICKETS)
         }
         vm.prank(organizer);
         vm.expectRevert(Squads.TooManyTickets.selector);
@@ -314,88 +342,53 @@ contract SquadsTest is Test {
     }
 
     function test_AddTickets_revertsForNonOrganizer() public {
-        _createPool(organizer, 100);
+        _createPool(organizer, 5);
         // Pools are keyed by (msg.sender, drawingId), so a stranger has no pool here.
         vm.prank(stranger);
         vm.expectRevert(Squads.PoolNotFound.selector);
         squads.addTickets(drawingId, _picks(1));
     }
 
-    function test_AddTickets_revertsAfterLock() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 2);
-        _lock(organizer);
-        vm.prank(organizer);
-        vm.expectRevert(Squads.WrongState.selector);
-        squads.addTickets(drawingId, _picks(1));
-    }
-
     function test_LargePoolViaRepeatedAddTickets() public {
-        _createPool(organizer, 100);
+        _createPool(organizer, 10);
         _addTickets(organizer, 10);
-        _addTickets(organizer, 10);
-        _addTickets(organizer, 10); // 30 tickets via repeated <=10 synchronous buys
-
-        (,,,,,, uint256 ticketCount,,, uint256 ticketFunding,,) = squads.getPool(organizer, drawingId);
-        assertEq(ticketCount, 30);
-        assertEq(ticketFunding, 30 * TICKET_PRICE);
-        assertEq(squads.getTicketIds(organizer, drawingId).length, 30);
+        _addTickets(organizer, 10); // 30 tickets total
+        assertEq(_ticketCount(organizer), 30);
 
         // ...and the pool settles normally.
         _lock(organizer);
-        _buy(alice, organizer, 98);
+        _buy(alice, organizer, DEFAULT_FOR_SALE);
         _settle();
         uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
         _setWinner(ids[0], 1, 100 * TICKET_PRICE);
         squads.claimAndDistribute(organizer, drawingId);
-
-        (Squads.State state,,,,,,,,,,,) = squads.getPool(organizer, drawingId);
-        assertEq(uint256(state), uint256(Squads.State.Settled));
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Settled));
         _assertSolvent();
     }
 
     // ---------------------------------------------------------------------
-    // lock
+    // lock (opens shares; no stored cutoff)
     // ---------------------------------------------------------------------
 
-    function test_Lock() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+    function test_LockOpensSharesWithoutCutoff() public {
+        _createPool(organizer, 5); // default reserve 250 bps
         _lock(organizer);
 
-        (
-            Squads.State state,
-            ,
-            uint256 totalShares,
-            uint256 sharesForSale,
-            ,
-            uint256 reserveShares,
-            ,
-            ,
-            uint256 pricePerShare,
-            ,
-            ,
-        ) = squads.getPool(organizer, drawingId);
-        assertEq(uint256(state), uint256(Squads.State.Live));
-        // createPool(100, 250 bps): the reserve is carved OUT of totalShares; the rest is sold.
-        assertEq(totalShares, 100);
-        assertEq(reserveShares, 2); // floor(100 * 250 / 10000)
-        assertEq(sharesForSale, 98); // totalShares - reserveShares
-        assertEq(pricePerShare, (5 * TICKET_PRICE) / 100); // ticketFunding / totalShares = 50_000
-        assertEq(squads.sharesOf(organizer, drawingId, organizer), 2); // reserve granted to organizer
-        _assertSolvent();
-    }
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Live));
+        assertEq(_totalShares(organizer), TOTAL_SHARES);
+        assertEq(_reserveShares(organizer), 25); // 1000 * 250 / 10000
+        assertEq(_sharesForSale(organizer), DEFAULT_FOR_SALE); // 975
+        assertEq(_pricePerShare(organizer), (5 * TICKET_PRICE) / TOTAL_SHARES); // ticketFunding / TOTAL_SHARES
+        assertEq(squads.sharesOf(organizer, drawingId, organizer), 25); // reserve granted
 
-    function test_Lock_revertsWithoutTickets() public {
-        _createPool(organizer, 100);
-        vm.prank(organizer);
-        vm.expectRevert(Squads.NoTickets.selector);
-        squads.lock(drawingId);
+        // Shares are open for sale (no stored salesCloseTime exists) — a buy succeeds.
+        _buy(alice, organizer, 1);
+        assertEq(squads.sharesOf(organizer, drawingId, alice), 1);
+        _assertSolvent();
     }
 
     function test_Lock_revertsIfNotBuilding() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 1);
+        _createPool(organizer, 1);
         _lock(organizer);
         vm.prank(organizer);
         vm.expectRevert(Squads.WrongState.selector);
@@ -407,8 +400,7 @@ contract SquadsTest is Test {
     // ---------------------------------------------------------------------
 
     function test_BuyShares() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
 
         uint256 price = squads.quoteShares(organizer, drawingId, 10);
@@ -419,15 +411,13 @@ contract SquadsTest is Test {
 
         assertEq(squads.sharesOf(organizer, drawingId, alice), 10);
         assertEq(usdc.balanceOf(alice), aliceBefore - price);
-        // Organizer reimbursed via claimable (pull-based), not pushed.
-        assertEq(usdc.balanceOf(organizer), orgBefore);
+        assertEq(usdc.balanceOf(organizer), orgBefore); // reimbursed via claimable, not pushed
         assertEq(squads.claimableOf(organizer, drawingId, organizer), price);
         _assertSolvent();
     }
 
     function test_BuySharesFor_gift() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
 
         uint256 bobBefore = usdc.balanceOf(bob);
@@ -441,77 +431,86 @@ contract SquadsTest is Test {
     }
 
     function test_BuyShares_revertsBeforeLock() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         vm.prank(alice);
         vm.expectRevert(Squads.WrongState.selector);
         squads.buyShares(organizer, drawingId, 1);
     }
 
     function test_BuyShares_revertsOverCapacity() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
         vm.prank(alice);
         vm.expectRevert(Squads.ExceedsForSale.selector);
-        squads.buyShares(organizer, drawingId, 99); // only 98 for sale
+        squads.buyShares(organizer, drawingId, DEFAULT_FOR_SALE + 1); // only 975 for sale
     }
 
-    function test_BuyShares_revertsAfterClose() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+    function test_BuySharesAllowedUntilDrawing() public {
+        _createPool(organizer, 5);
         _lock(organizer);
-        vm.warp(block.timestamp + 23 hours); // == salesCloseTime
-        vm.prank(alice);
+
+        // Open: shares are purchasable.
+        _buy(alice, organizer, 10);
+        assertEq(squads.sharesOf(organizer, drawingId, alice), 10);
+
+        // Reaching the drawing's close time closes sales — gated on live Megapot state, no cutoff.
+        uint256 dt = jackpot.getDrawingState(drawingId).drawingTime;
+        vm.warp(dt);
+        vm.prank(bob);
+        vm.expectRevert(Squads.SalesClosed.selector);
+        squads.buyShares(organizer, drawingId, 1);
+    }
+
+    function test_BuyShares_revertsOnceDrawn() public {
+        _createPool(organizer, 5);
+        _lock(organizer);
+        _buy(alice, organizer, 10);
+
+        _settle(); // winningTicket set -> drawing closed
+        vm.prank(bob);
         vm.expectRevert(Squads.SalesClosed.selector);
         squads.buyShares(organizer, drawingId, 1);
     }
 
     // ---------------------------------------------------------------------
-    // claimAndDistribute — the riskiest path
+    // claimAndDistribute — the riskiest path (totalShares = 1000)
     // ---------------------------------------------------------------------
 
     function test_Settle_winning_soldOut() public {
-        _createPool(organizer, 100); // 250 bps reserve -> reserveShares 2, sharesForSale 98
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5); // reserve 25, sharesForSale 975
         _lock(organizer);
-        _buy(alice, organizer, 98); // buys every for-sale share -> sold out
+        _buy(alice, organizer, DEFAULT_FOR_SALE); // every for-sale share -> sold out
 
         uint256 feesCollected = (5 * TICKET_PRICE * FEE_RATE) / 1e18; // 500_000
 
         _settle();
         uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
-        _setWinner(ids[0], 1, 100 * TICKET_PRICE); // 100 USDC prize on a winning ticket
+        _setWinner(ids[0], 1, 100 * TICKET_PRICE); // 100 USDC prize
 
         squads.claimAndDistribute(organizer, drawingId);
 
-        (, bool soldOut,,,,,,,,, uint256 totalWinnings,) = squads.getPool(organizer, drawingId);
-        assertTrue(soldOut);
-        assertEq(totalWinnings, 100 * TICKET_PRICE);
+        assertTrue(_soldOut(organizer));
+        assertEq(_totalWinnings(organizer), 100 * TICKET_PRICE);
 
-        // Carve-out: organizer holds the reserve (2 of 100), alice 98. Winnings and the
-        // sold-out fee rebate both split pro rata by totalShares.
-        uint256 aliceWin = (100 * TICKET_PRICE * 98) / 100; // 98 USDC
-        uint256 aliceFee = (feesCollected * 98) / 100; // 490_000
+        // organizer holds reserve 25 of 1000, alice 975. Winnings + sold-out fee rebate split by total.
+        uint256 aliceWin = (100 * TICKET_PRICE * 975) / 1000; // 97.5 USDC
+        uint256 aliceFee = (feesCollected * 975) / 1000; // 487_500
         assertEq(squads.claimableOf(organizer, drawingId, alice), aliceWin + aliceFee);
 
-        uint256 orgReimburse = squads.quoteShares(organizer, drawingId, 98); // 98 * 50_000
-        uint256 orgWin = (100 * TICKET_PRICE * 2) / 100; // 2 USDC
-        uint256 orgFee = (feesCollected * 2) / 100; // 10_000
+        uint256 orgReimburse = squads.quoteShares(organizer, drawingId, 975);
+        uint256 orgWin = (100 * TICKET_PRICE * 25) / 1000; // 2.5 USDC
+        uint256 orgFee = (feesCollected * 25) / 1000; // 12_500
         assertEq(squads.claimableOf(organizer, drawingId, organizer), orgReimburse + orgWin + orgFee);
 
-        // No fees left locked; counters consistent.
-        (,,,,,,,,,,, uint256 feesAfter) = squads.getPool(organizer, drawingId);
-        assertEq(feesAfter, 0);
+        assertEq(_feesCollected(organizer), 0);
         assertEq(squads.totalFeesLocked(), 0);
         _assertSolvent();
     }
 
     function test_Settle_winning_undersold() public {
-        _createPool(organizer, 100); // reserveShares 2, sharesForSale 98
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
-        _buy(alice, organizer, 40); // 58 of 98 unsold -> NOT sold out
+        _buy(alice, organizer, 40); // 935 of 975 unsold -> NOT sold out
 
         uint256 feesCollected = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
 
@@ -521,80 +520,68 @@ contract SquadsTest is Test {
 
         squads.claimAndDistribute(organizer, drawingId);
 
-        (, bool soldOut,,,,,,,,,,) = squads.getPool(organizer, drawingId);
-        assertFalse(soldOut);
-
-        // Organizer holds reserve 2 + unsold 58 = 60 of 100 shares.
-        assertEq(squads.sharesOf(organizer, drawingId, organizer), 60);
+        assertFalse(_soldOut(organizer));
+        // Organizer holds reserve 25 + unsold 935 = 960 of 1000.
+        assertEq(squads.sharesOf(organizer, drawingId, organizer), 960);
         assertEq(squads.sharesOf(organizer, drawingId, alice), 40);
 
-        // Winnings amplified to the organizer; undersold -> ALL fees to organizer.
-        uint256 aliceWin = (100 * TICKET_PRICE * 40) / 100; // 40 USDC
+        uint256 aliceWin = (100 * TICKET_PRICE * 40) / 1000; // 4 USDC
         assertEq(squads.claimableOf(organizer, drawingId, alice), aliceWin);
 
         uint256 orgReimburse = squads.quoteShares(organizer, drawingId, 40);
-        uint256 orgWin = (100 * TICKET_PRICE * 60) / 100; // 60 USDC
+        uint256 orgWin = (100 * TICKET_PRICE * 960) / 1000; // 96 USDC
+        // Undersold -> ALL fees to organizer.
         assertEq(squads.claimableOf(organizer, drawingId, organizer), orgReimburse + orgWin + feesCollected);
         _assertSolvent();
     }
 
     function test_Settle_losing() public {
-        _createPool(organizer, 100); // reserveShares 2, sharesForSale 98
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
-        _buy(alice, organizer, 98); // sold out
+        _buy(alice, organizer, DEFAULT_FOR_SALE); // sold out
 
         _settle();
-        // No winners set: every ticket is tier 0 -> skipped, totalWinnings == 0.
-        squads.claimAndDistribute(organizer, drawingId);
+        squads.claimAndDistribute(organizer, drawingId); // no winners -> totalWinnings 0
 
-        (,,,,,,,,,, uint256 totalWinnings,) = squads.getPool(organizer, drawingId);
-        assertEq(totalWinnings, 0);
-        // Sold out, so the referral fees still get rebated to holders (alice holds 98/100).
+        assertEq(_totalWinnings(organizer), 0);
+        // Sold out, so the referral fees still get rebated to holders (alice holds 975/1000).
         uint256 feesCollected = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
-        assertEq(squads.claimableOf(organizer, drawingId, alice), (feesCollected * 98) / 100);
+        assertEq(squads.claimableOf(organizer, drawingId, alice), (feesCollected * 975) / 1000);
         _assertSolvent();
     }
 
     function test_Settle_revertsIfNotSettled() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
         _buy(alice, organizer, 10);
-        // Drawing not yet drawn.
         vm.expectRevert(Squads.DrawingNotSettled.selector);
         squads.claimAndDistribute(organizer, drawingId);
     }
 
     function test_Settle_neverLocked_goesToOrganizer() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5); // organizer never locks
+        _createPool(organizer, 5); // organizer never locks
         _settle();
         uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
         _setWinner(ids[0], 1, 100 * TICKET_PRICE);
 
         squads.claimAndDistribute(organizer, drawingId);
 
-        // Organizer is the sole holder of all 100 shares (reserve 2 + unsold 98) -> all
-        // winnings + fees.
-        assertEq(squads.sharesOf(organizer, drawingId, organizer), 100);
+        // Organizer is the sole holder of all 1000 shares (reserve 25 + unsold 975) -> all winnings + fees.
+        assertEq(squads.sharesOf(organizer, drawingId, organizer), TOTAL_SHARES);
         uint256 feesCollected = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
         assertEq(squads.claimableOf(organizer, drawingId, organizer), 100 * TICKET_PRICE + feesCollected);
         _assertSolvent();
     }
 
     function test_Settle_isPermissionless() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 3);
+        _createPool(organizer, 3);
         _lock(organizer);
-        _buy(alice, organizer, 98);
+        _buy(alice, organizer, DEFAULT_FOR_SALE);
         _settle();
 
-        // A stranger can settle; no party can freeze a pool.
-        vm.prank(stranger);
+        vm.prank(stranger); // anyone can settle; no party can freeze a pool
         squads.claimAndDistribute(organizer, drawingId);
-        (Squads.State state,,,,,,,,,,,) = squads.getPool(organizer, drawingId);
-        assertEq(uint256(state), uint256(Squads.State.Settled));
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Settled));
         _assertSolvent();
     }
 
@@ -603,10 +590,9 @@ contract SquadsTest is Test {
     // ---------------------------------------------------------------------
 
     function test_Withdraw() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
-        _buy(alice, organizer, 98);
+        _buy(alice, organizer, DEFAULT_FOR_SALE);
         _settle();
         uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
         _setWinner(ids[0], 1, 100 * TICKET_PRICE);
@@ -623,15 +609,13 @@ contract SquadsTest is Test {
         assertEq(squads.claimableOf(organizer, drawingId, alice), 0);
         _assertSolvent();
 
-        // Double withdraw reverts.
         vm.prank(alice);
         vm.expectRevert(Squads.NothingToWithdraw.selector);
         squads.withdraw(organizer, drawingId);
     }
 
     function test_Withdraw_revertsWhenNothing() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 1);
+        _createPool(organizer, 1);
         _lock(organizer);
         vm.prank(stranger);
         vm.expectRevert(Squads.NothingToWithdraw.selector);
@@ -639,22 +623,13 @@ contract SquadsTest is Test {
     }
 
     // ---------------------------------------------------------------------
-    // cancel
+    // cancel (now only reachable on an empty pool, which can no longer exist)
     // ---------------------------------------------------------------------
 
-    function test_Cancel_emptyPool() public {
-        _createPool(organizer, 100);
-        vm.prank(organizer);
-        squads.cancel(drawingId);
-        assertFalse(squads.poolExists(organizer, drawingId));
-        // Slot is free again.
-        _createPool(organizer, 50);
-        assertTrue(squads.poolExists(organizer, drawingId));
-    }
-
-    function test_Cancel_revertsAfterTickets() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 1);
+    function test_CancelRevertsOncePoolHasTickets() public {
+        // createPool always buys >= 1 ticket, so a Building pool always has tickets and cancel
+        // can never delete it (no empty pools exist).
+        _createPool(organizer, 5);
         vm.prank(organizer);
         vm.expectRevert(Squads.TicketsAlreadyBought.selector);
         squads.cancel(drawingId);
@@ -670,15 +645,13 @@ contract SquadsTest is Test {
 
         vm.prank(organizer);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), "x");
+        squads.createPool(drawingId, 5, DEFAULT_RESERVE_BPS, "x");
     }
 
-    function test_Pause_allowsSettleWithdrawCancel() public {
-        // Build + go live, then pause: settle/withdraw must still work.
-        _createPool(organizer, 100);
-        _addTickets(organizer, 3);
+    function test_Pause_allowsSettleAndWithdraw() public {
+        _createPool(organizer, 3);
         _lock(organizer);
-        _buy(alice, organizer, 98); // sold out, so the losing pool's fees rebate to alice
+        _buy(alice, organizer, DEFAULT_FOR_SALE); // sold out -> losing pool's fees rebate to alice
         _settle();
 
         vm.prank(admin);
@@ -698,52 +671,52 @@ contract SquadsTest is Test {
     }
 
     // ---------------------------------------------------------------------
-    // misc: self-purchase, dust, multi-holder, multi-pool invariant
+    // misc: self-purchase, dust, multi-pool invariant
     // ---------------------------------------------------------------------
 
     function test_OrganizerSelfPurchaseUncapped() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
-        // Organizer buys all of its own for-sale shares (the "squad of one"). Allowed.
-        _buy(organizer, organizer, 98);
-        assertEq(squads.sharesOf(organizer, drawingId, organizer), 100); // 2 reserve + 98 bought
+        _buy(organizer, organizer, DEFAULT_FOR_SALE); // organizer buys all its for-sale shares
+        assertEq(squads.sharesOf(organizer, drawingId, organizer), TOTAL_SHARES); // 25 reserve + 975
         _assertSolvent();
     }
 
     function test_Distribution_dustToOrganizer() public {
-        // totalShares = 3 doesn't divide a 100-USDC prize evenly -> dust to organizer.
-        _createPool(organizer, 3);
-        _addTickets(organizer, 1);
-        _lock(organizer); // autoStake = 0 (2.5% of 3 floors to 0), sharesForSale = 3
+        // A prize that does not divide evenly across 1000 shares -> floor each holder, dust to organizer.
+        _createPool(organizer, 1, 0); // reserve 0 -> sharesForSale 1000
+        _lock(organizer);
         _buy(alice, organizer, 1);
         _buy(bob, organizer, 1);
-        // 1 share left unsold -> organizer at settle. Holders: alice 1, bob 1, organizer 1.
+        // alice 1, bob 1, organizer 998 (unsold) of 1000.
 
         _settle();
         uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
-        _setWinner(ids[0], 1, 100 * TICKET_PRICE);
+        uint256 prize = 100 * TICKET_PRICE + 777; // not divisible by 1000
+        _setWinner(ids[0], 1, prize);
         squads.claimAndDistribute(organizer, drawingId);
 
-        uint256 each = (100 * TICKET_PRICE) / 3; // floor
-        uint256 dust = 100 * TICKET_PRICE - 3 * each;
-        assertEq(squads.claimableOf(organizer, drawingId, alice), each);
-        assertEq(squads.claimableOf(organizer, drawingId, bob), each);
-        // organizer gets: share proceeds (reimbursement) + its own winnings share + dust +
-        // ALL referral fees (the pool is undersold, so fees route to the organizer).
-        uint256 orgReimburse = squads.quoteShares(organizer, drawingId, 2); // alice+bob proceeds
-        uint256 feesCollected = (1 * TICKET_PRICE * FEE_RATE) / 1e18; // 100_000, undersold -> organizer
-        assertEq(squads.claimableOf(organizer, drawingId, organizer), orgReimburse + each + dust + feesCollected);
+        uint256 aliceWin = (prize * 1) / 1000;
+        uint256 bobWin = (prize * 1) / 1000;
+        uint256 orgShareWin = (prize * 998) / 1000;
+        uint256 dust = prize - (aliceWin + bobWin + orgShareWin);
+        assertGt(dust, 0); // the prize doesn't divide evenly
 
-        // Total credited winnings exactly equals the prize (no strand, no overflow).
-        assertEq(each * 3 + dust, 100 * TICKET_PRICE);
+        assertEq(squads.claimableOf(organizer, drawingId, alice), aliceWin);
+        assertEq(squads.claimableOf(organizer, drawingId, bob), bobWin);
+
+        // organizer: reimbursement + own winnings share + dust + ALL fees (undersold).
+        uint256 orgReimburse = squads.quoteShares(organizer, drawingId, 2); // alice + bob proceeds
+        uint256 feesCollected = (1 * TICKET_PRICE * FEE_RATE) / 1e18;
+        assertEq(squads.claimableOf(organizer, drawingId, organizer), orgReimburse + orgShareWin + dust + feesCollected);
+        // Conservation: every micro-USDC of the prize is credited.
+        assertEq(aliceWin + bobWin + orgShareWin + dust, prize);
         _assertSolvent();
     }
 
     function test_MultiPool_invariantHolds() public {
         // Two organizers, two pools sharing the one contract balance.
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
         _buy(alice, organizer, 50);
         _assertSolvent();
@@ -751,9 +724,7 @@ contract SquadsTest is Test {
         address org2 = address(0xBEEF);
         _fund(org2, 100 * TICKET_PRICE);
         vm.prank(org2);
-        squads.createPool(drawingId, 200, DEFAULT_RESERVE_BPS, _closeTime(), "Squad 2");
-        vm.prank(org2);
-        squads.addTickets(drawingId, _picks(8));
+        squads.createPool(drawingId, 8, DEFAULT_RESERVE_BPS, "Squad 2");
         _lock(org2);
         _buy(bob, org2, 100);
         _assertSolvent();
@@ -767,8 +738,7 @@ contract SquadsTest is Test {
         squads.claimAndDistribute(org2, drawingId); // org2 lost; fees still resolve
         _assertSolvent();
 
-        // Everyone with a balance withdraws; bob's pool lost AND was undersold, so he is
-        // legitimately owed nothing. After draining all holders the counters hit zero.
+        // Everyone with a balance withdraws; bob's pool lost AND was undersold, so he is owed nothing.
         _tryWithdraw(alice, organizer);
         _tryWithdraw(bob, org2);
         _tryWithdraw(organizer, organizer);
@@ -780,64 +750,52 @@ contract SquadsTest is Test {
     }
 
     // ---------------------------------------------------------------------
-    // Organizer reserve: chosen percentage carved out of totalShares
+    // Organizer reserve: chosen percentage carved out of the fixed total
     // ---------------------------------------------------------------------
 
     function test_ReserveZeroSellsEntirePool() public {
-        _createPool(organizer, 1000, 0); // reserve 0 -> the whole pool is for sale
-        _addTickets(organizer, 10); // ticketFunding = 10 USDC
+        _createPool(organizer, 10, 0); // 10 tickets, reserve 0 -> whole pool for sale
         _lock(organizer);
 
-        // Nothing reserved: organizer holds 0, the full supply is for sale.
         assertEq(squads.sharesOf(organizer, drawingId, organizer), 0);
-        (,, uint256 totalShares, uint256 sharesForSale,, uint256 reserveShares,,,,,,) =
-            squads.getPool(organizer, drawingId);
-        assertEq(reserveShares, 0);
-        assertEq(totalShares, 1000);
-        assertEq(sharesForSale, totalShares);
+        assertEq(_reserveShares(organizer), 0);
+        assertEq(_sharesForSale(organizer), TOTAL_SHARES);
 
         // Full sellout reimburses ticketFunding exactly (1000 evenly divides 10e6).
-        _buy(alice, organizer, 1000);
+        _buy(alice, organizer, TOTAL_SHARES);
         assertEq(squads.claimableOf(organizer, drawingId, organizer), 10 * TICKET_PRICE);
         _assertSolvent();
     }
 
     function test_ReserveCarvesOutShares() public {
-        _createPool(organizer, 1000, 250); // 2.5%
-        _addTickets(organizer, 10);
+        _createPool(organizer, 10, 250); // 2.5%
         _lock(organizer);
-
-        (,, uint256 totalShares, uint256 sharesForSale,, uint256 reserveShares,,,,,,) =
-            squads.getPool(organizer, drawingId);
-        assertEq(reserveShares, 25);
-        assertEq(sharesForSale, 975);
-        assertEq(totalShares, 1000);
+        assertEq(_reserveShares(organizer), 25);
+        assertEq(_sharesForSale(organizer), 975);
+        assertEq(_totalShares(organizer), TOTAL_SHARES);
         assertEq(squads.sharesOf(organizer, drawingId, organizer), 25);
         _assertSolvent();
     }
 
     function test_ReserveReimbursementShortfallEqualsStakeValue() public {
-        _createPool(organizer, 1000, 2000); // 20% reserve
-        _addTickets(organizer, 10); // ticketFunding = 10 USDC
+        _createPool(organizer, 10, 2000); // 20% reserve
         _lock(organizer);
         _buy(alice, organizer, 800); // full sellout (1000 - 200 reserve)
 
         // Before settlement the organizer's claimable is pure reimbursement = soldShares * price.
-        uint256 price = squads.quoteShares(organizer, drawingId, 1); // pricePerShare
+        uint256 price = squads.quoteShares(organizer, drawingId, 1);
         uint256 reimburse = squads.claimableOf(organizer, drawingId, organizer);
         assertEq(reimburse, 800 * price); // $8.00
 
-        // The shortfall vs ticketFunding is exactly the value of the reserved shares.
         uint256 ticketFunding = 10 * TICKET_PRICE;
-        assertEq(ticketFunding - reimburse, 200 * price); // reserveShares * price = $2.00
+        assertEq(ticketFunding - reimburse, 200 * price); // shortfall == reserveShares * price = $2.00
         _assertSolvent();
     }
 
     function test_ReserveOwnershipInWinnings() public {
-        _createPool(organizer, 1000, 2000); // 20%
-        _addTickets(organizer, 10);
+        _createPool(organizer, 10, 2000); // 20%
         _lock(organizer);
-        _buy(alice, organizer, 800); // full sellout; organizer holds reserve 200/1000 = 20%
+        _buy(alice, organizer, 800);
 
         _settle();
         uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
@@ -845,10 +803,9 @@ contract SquadsTest is Test {
         _setWinner(ids[0], 1, prize);
         squads.claimAndDistribute(organizer, drawingId);
 
-        // Organizer's winnings cut == prize * reserveShares / totalShares (20%); alice gets the rest.
-        uint256 orgWin = (prize * 200) / 1000; // 100 USDC
+        uint256 orgWin = (prize * 200) / 1000; // 100 USDC = 20%
         uint256 aliceWin = (prize * 800) / 1000; // 400 USDC
-        assertEq(orgWin + aliceWin, prize); // exact split, no dust
+        assertEq(orgWin + aliceWin, prize);
 
         uint256 feesCollected = (10 * TICKET_PRICE * FEE_RATE) / 1e18;
         uint256 aliceFee = (feesCollected * 800) / 1000;
@@ -861,15 +818,10 @@ contract SquadsTest is Test {
     }
 
     function test_HighReserveAllowed() public {
-        _createPool(organizer, 1000, 7500); // 75% reserve
-        _addTickets(organizer, 10); // ticketFunding = 10 USDC
+        _createPool(organizer, 10, 7500); // 75% reserve
         _lock(organizer);
-
-        (,, uint256 totalShares, uint256 sharesForSale,, uint256 reserveShares,,,,,,) =
-            squads.getPool(organizer, drawingId);
-        assertEq(reserveShares, 750);
-        assertEq(sharesForSale, 250);
-        assertEq(totalShares, 1000);
+        assertEq(_reserveShares(organizer), 750);
+        assertEq(_sharesForSale(organizer), 250);
         assertEq(squads.sharesOf(organizer, drawingId, organizer), 750);
 
         // Full sellout reimburses only $2.50 on a $10 pool (250 * 10_000).
@@ -882,17 +834,18 @@ contract SquadsTest is Test {
         // 100% reserve leaves nothing for players to buy.
         vm.prank(organizer);
         vm.expectRevert(Squads.InvalidReserve.selector);
-        squads.createPool(drawingId, 1000, 10_000, _closeTime(), "all");
+        squads.createPool(drawingId, 5, 10_000, "all");
 
-        // Over 100% likewise.
         vm.prank(organizer);
         vm.expectRevert(Squads.InvalidReserve.selector);
-        squads.createPool(drawingId, 1000, 10_001, _closeTime(), "over");
+        squads.createPool(drawingId, 5, 10_001, "over");
 
-        // Anything below 100% is allowed — even 99.99% on a 1-share pool still leaves 1 for sale
-        // (reserveBps < 100% guarantees sharesForSale >= 1, so truncation-to-0 can't occur).
-        _createPool(organizer, 1, 9_999);
-        assertTrue(squads.poolExists(organizer, drawingId));
+        // Anything below 100% is allowed — even 99.99% leaves >= 1 share for sale
+        // (reserveShares = floor(1000 * 9999 / 10000) = 999, sharesForSale = 1, set at lock).
+        _createPool(organizer, 5, 9_999);
+        _lock(organizer);
+        assertEq(_reserveShares(organizer), 999);
+        assertEq(_sharesForSale(organizer), 1);
     }
 
     // ---------------------------------------------------------------------
@@ -902,12 +855,10 @@ contract SquadsTest is Test {
     function test_SalesFeeStillAtomicAndCorrect() public {
         // No win-share configured: the sales fee is collected atomically at buy time and fully
         // attributed to the pool, with nothing left in the shared bucket.
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
 
-        (,,,,,,,,,,, uint256 feesCollected) = squads.getPool(organizer, drawingId);
         uint256 salesFee = (5 * TICKET_PRICE * FEE_RATE) / 1e18; // 500_000
-        assertEq(feesCollected, salesFee);
+        assertEq(_feesCollected(organizer), salesFee);
         assertEq(squads.totalFeesLocked(), salesFee);
         assertEq(squads.unattributedFees(), 0);
         _assertSolvent();
@@ -915,10 +866,9 @@ contract SquadsTest is Test {
 
     function test_WinShareWhenNoConcurrentSweep() public {
         jackpot.setWinShareRate(0.1e18); // 10% win-share referral
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
         _lock(organizer);
-        _buy(alice, organizer, 98); // sold out
+        _buy(alice, organizer, DEFAULT_FOR_SALE); // sold out
 
         _settle();
         uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
@@ -929,14 +879,13 @@ contract SquadsTest is Test {
 
         squads.claimAndDistribute(organizer, drawingId);
 
-        // The pool collected its win-share; nothing stranded in the bucket.
-        assertEq(squads.unattributedFees(), 0);
+        assertEq(squads.unattributedFees(), 0); // pool collected its win-share, nothing stranded
 
-        // Sold out -> total fees (sales + win-share) rebated pro rata; alice holds 98/100.
+        // Sold out -> total fees (sales + win-share) rebated pro rata; alice holds 975/1000.
         uint256 salesFee = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
         uint256 totalFees = salesFee + winShare;
-        uint256 aliceWin = (prize * 98) / 100;
-        uint256 aliceFeeShare = (totalFees * 98) / 100;
+        uint256 aliceWin = (prize * 975) / 1000;
+        uint256 aliceFeeShare = (totalFees * 975) / 1000;
         assertEq(squads.claimableOf(organizer, drawingId, alice), aliceWin + aliceFeeShare);
         _assertSolvent();
     }
@@ -948,10 +897,9 @@ contract SquadsTest is Test {
         _fund(orgB, 1_000 * TICKET_PRICE);
 
         // Pool A in drawing 1: build, lock, sell out.
-        _createPool(orgA, 100);
-        _addTickets(orgA, 5);
+        _createPool(orgA, 5);
         _lock(orgA);
-        _buy(alice, orgA, 98);
+        _buy(alice, orgA, DEFAULT_FOR_SALE);
 
         // Settle drawing 1; A's ticket wins, and A's win-share accrues to the aggregate at
         // settlement (the worst-case timing the fix must tolerate).
@@ -962,43 +910,36 @@ contract SquadsTest is Test {
         uint256 winShareA = (prize * 0.1e18) / 1e18; // 10 USDC
         _accrueWinShare(winShareA);
 
-        // CONCURRENCY: pool B (next drawing) buys tickets BEFORE A settles. B's buy sweeps the
-        // aggregate — including A's pending win-share — but draws only B's own sales fee.
+        // CONCURRENCY: pool B (next drawing) is created — its atomic ticket buy sweeps the aggregate
+        // (including A's pending win-share) but draws only B's own sales fee.
         uint256 drawB = jackpot.currentDrawingId(); // 2
         vm.prank(orgB);
-        squads.createPool(drawB, 100, DEFAULT_RESERVE_BPS, _closeTime(), "B");
-        vm.prank(orgB);
-        squads.addTickets(drawB, _picks(3));
+        squads.createPool(drawB, 3, DEFAULT_RESERVE_BPS, "B");
 
-        // B did NOT capture A's win-share: B's locked fees are only its own 3-ticket sales fee,
-        // and A's win-share sits parked in the shared bucket.
         uint256 bSalesFee = (3 * TICKET_PRICE * FEE_RATE) / 1e18; // 300_000
-        (,,,,,,,,,,, uint256 bFees) = squads.getPool(orgB, drawB);
-        assertEq(bFees, bSalesFee);
-        assertEq(squads.unattributedFees(), winShareA);
+        assertEq(_feesCollected(orgB, drawB), bSalesFee);
+        assertEq(squads.unattributedFees(), winShareA); // A's win-share parked in the bucket
 
         // Now A settles and collects ITS win-share from the bucket.
         squads.claimAndDistribute(orgA, drawingId);
         assertEq(squads.unattributedFees(), 0);
 
-        // A's holders received A's win-share (sold-out rebate); alice holds 98/100 of A.
+        // A's holders received A's win-share (sold-out rebate); alice holds 975/1000 of A.
         uint256 aSalesFee = (5 * TICKET_PRICE * FEE_RATE) / 1e18;
-        uint256 aliceWin = (prize * 98) / 100;
-        uint256 aliceFeeShare = ((aSalesFee + winShareA) * 98) / 100;
+        uint256 aliceWin = (prize * 975) / 1000;
+        uint256 aliceFeeShare = ((aSalesFee + winShareA) * 975) / 1000;
         assertEq(squads.claimableOf(orgA, drawingId, alice), aliceWin + aliceFeeShare);
 
         // B still has only its own sales fee — it never received A's win-share.
-        (,,,,,,,,,,, uint256 bFeesAfter) = squads.getPool(orgB, drawB);
-        assertEq(bFeesAfter, bSalesFee);
+        assertEq(_feesCollected(orgB, drawB), bSalesFee);
         _assertSolvent();
     }
 
     function test_SweepUnattributedOnlyTransfersSurplus() public {
-        _createPool(organizer, 100);
-        _addTickets(organizer, 5);
+        _createPool(organizer, 5);
 
-        // A stray win-share enters the aggregate (e.g. another pool's pending share), then a buy
-        // sweeps it into the bucket but draws only its own sales fee, leaving the stray parked.
+        // A stray win-share enters the aggregate, then a buy sweeps it into the bucket but draws
+        // only its own sales fee, leaving the stray parked.
         uint256 stray = 7 * TICKET_PRICE;
         _accrueWinShare(stray);
         _addTickets(organizer, 2);
@@ -1006,7 +947,7 @@ contract SquadsTest is Test {
         _assertSolvent();
 
         _lock(organizer);
-        _buy(alice, organizer, 98); // sold out
+        _buy(alice, organizer, DEFAULT_FOR_SALE); // sold out
         _settle();
         squads.claimAndDistribute(organizer, drawingId); // losing; fees rebated to holders
 

@@ -20,16 +20,16 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *         takes no fee — the goal is Megapot ticket volume.
  *
  *         LIFECYCLE  (Building -> Live -> Settled)
- *           Building : organizer-only. createPool, then addTickets / addRandomTickets
- *                      (repeatable). The organizer fronts the USDC for every ticket;
- *                      Squads buys them from Megapot as both holder and referrer, and
- *                      sweeps each purchase's referral fee immediately, locking it in
- *                      the pool. No shares are sold yet.
- *           Live     : organizer calls lock() when done. The ticket set is frozen,
- *                      pricePerShare is fixed at ticketFunding / totalShares, the
- *                      organizer is granted its autoStake shares, and players may buy
- *                      shares until salesCloseTime. Share proceeds reimburse the
- *                      organizer immediately (pull-based).
+ *           Building : organizer-only. createPool buys the initial tickets atomically (>= 1),
+ *                      then addTickets / addRandomTickets may add more (repeatable). The
+ *                      organizer fronts the USDC for every ticket; Squads buys them from Megapot
+ *                      as both holder and referrer and sweeps each purchase's referral fee
+ *                      immediately, locking it in the pool. No shares are sold yet.
+ *           Live     : organizer calls lock() when done. The ticket set is frozen, pricePerShare
+ *                      is fixed at ticketFunding / TOTAL_SHARES, the organizer is granted its
+ *                      reserve shares, and players may buy shares until the Megapot drawing closes
+ *                      (gated on live drawing state, no stored cutoff). Share proceeds reimburse
+ *                      the organizer immediately (pull-based).
  *           Settled  : after the drawing settles, anyone calls claimAndDistribute().
  *                      Unsold shares are assigned to the organizer (its risk-reward for
  *                      fronting cost), each winning ticket is claimed and measured by
@@ -79,9 +79,10 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     // Constants
     // -----------------------------------------------------------------------
 
-    /// @notice Minimum gap required between a pool's salesCloseTime and the drawing's
-    ///         drawingTime. Kills last-second front-running of a near-certain outcome.
-    uint256 public constant MIN_SELLING_WINDOW = 1 hours;
+    /// @notice Fixed share supply for every pool. Organizers choose a reserve PERCENTAGE of this,
+    ///         not a share count, so the absolute total is hidden from them. Reserve, pricing, and
+    ///         the pro-rata distribution all divide by / reference this same total.
+    uint256 internal constant TOTAL_SHARES = 1000;
 
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
@@ -91,9 +92,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
 
     /// @notice Upper bound on tickets in one pool. Bounds the claim loop in claimAndDistribute.
     uint256 public constant MAX_POOL_TICKETS = 100;
-
-    /// @notice Upper bound on totalShares. Bounds the distribution loop (holders <= shares).
-    uint256 public constant MAX_TOTAL_SHARES = 1_000;
 
     /// @notice Single-referrer weight passed to Megapot. The split is 1e18-scale and must
     ///         sum to exactly 1e18, so one 100% referrer uses the full weight.
@@ -147,7 +145,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         uint256 sharesSold; // shares bought by players during Live
         uint256 reserveShares; // shares the organizer keeps off the market (carved out); set at lock
         uint256 ticketCount;
-        uint64 salesCloseTime;
         uint256 ticketFunding; // USDC the organizer fronted for tickets
         uint256 pricePerShare; // fixed at lock = ticketFunding / totalShares
         uint256 totalWinnings; // set at distribution
@@ -183,14 +180,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     // Events
     // -----------------------------------------------------------------------
 
-    event PoolCreated(
-        address indexed organizer,
-        uint256 indexed drawingId,
-        uint256 totalShares,
-        uint256 reserveBps,
-        uint64 salesCloseTime,
-        string name
-    );
+    event PoolCreated(address indexed organizer, uint256 indexed drawingId, uint256 reserveBps, string name);
     event TicketsAdded(
         address indexed organizer, uint256 indexed drawingId, uint256 count, uint256 newTicketCount, uint256 feeSwept
     );
@@ -221,7 +211,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     // -----------------------------------------------------------------------
 
     error ZeroAddress();
-    error InvalidShares();
     error InvalidReserve();
     error NameTooLong();
     error InvalidTicketCount();
@@ -233,7 +222,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     error DrawingNotSettled();
     error SettlementInProgress();
     error SalesClosed();
-    error SellingWindowTooTight();
     error ExceedsForSale();
     error NoTickets();
     error TicketsAlreadyBought();
@@ -267,47 +255,46 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     // Building: create + add tickets
     // -----------------------------------------------------------------------
 
-    /// @notice Create a pool for the current open drawing. The organizer is msg.sender;
-    ///         one pool per (organizer, drawingId). No funds move here — tickets are
-    ///         bought via {addTickets} / {addRandomTickets}.
-    /// @param drawingId      Must equal Megapot's current (open) drawing id.
-    /// @param totalShares    Fixed share supply (e.g. 100 = one share per 1%). 1..MAX_TOTAL_SHARES.
-    /// @param reserveBps     The percentage of the pool (in basis points) the organizer keeps for
-    ///                       themselves and does not sell. 0 is valid (sell the whole pool); must
-    ///                       be < 100% so at least one share is left for players to buy. The
-    ///                       organizer pays for the reserve via foregone reimbursement (carve-out).
-    /// @param salesCloseTime When share sales close. Must leave >= MIN_SELLING_WINDOW before drawingTime.
-    /// @param name           Display name; emitted only.
-    function createPool(
-        uint256 drawingId,
-        uint256 totalShares,
-        uint256 reserveBps,
-        uint64 salesCloseTime,
-        string calldata name
-    ) external whenNotPaused {
+    /// @notice Create a pool for the current open drawing AND buy its initial tickets in the same
+    ///         transaction — no empty pools can exist. The organizer is msg.sender; one pool per
+    ///         (organizer, drawingId). More tickets can be added during Building via
+    ///         {addTickets} / {addRandomTickets}.
+    /// @param drawingId   Must equal Megapot's current (open) drawing id.
+    /// @param ticketCount Initial tickets to buy, >= 1 and <= MAX_POOL_TICKETS. Bought as quick-pick
+    ///                    in chunks of MEGAPOT_MAX_BATCH. Pulls ticketCount * ticketPrice USDC.
+    /// @param reserveBps  The percentage (in basis points) of the pool the organizer keeps and does
+    ///                    not sell. 0 is valid (sell the whole pool); must be < 100%. The organizer
+    ///                    pays for the reserve via foregone reimbursement (carve-out).
+    /// @param name        Display name; emitted only, never stored. <= MAX_NAME_BYTES bytes.
+    function createPool(uint256 drawingId, uint256 ticketCount, uint256 reserveBps, string calldata name)
+        external
+        nonReentrant
+        whenNotPaused
+    {
         if (bytes(name).length > MAX_NAME_BYTES) revert NameTooLong();
-        if (totalShares == 0 || totalShares > MAX_TOTAL_SHARES) revert InvalidShares();
-        // Reserve must leave at least one share to sell; 100%+ is not a pool. (reserveBps strictly
-        // below 100% guarantees sharesForSale >= 1, since floor(totalShares*reserveBps/BPS) < totalShares.)
+        if (ticketCount == 0) revert NoTickets();
+        if (ticketCount > MAX_POOL_TICKETS) revert TooManyTickets();
         if (reserveBps >= BPS_DENOMINATOR) revert InvalidReserve();
 
         Pool storage p = pools[_key(msg.sender, drawingId)];
         if (p.state != State.None) revert PoolExists();
         if (drawingId != JACKPOT.currentDrawingId()) revert DrawingNotOpen();
 
-        IJackpot.DrawingState memory ds = JACKPOT.getDrawingState(drawingId);
-        if (salesCloseTime <= block.timestamp) revert SalesClosed();
-        if (uint256(salesCloseTime) + MIN_SELLING_WINDOW > ds.drawingTime) revert SellingWindowTooTight();
-
         p.organizer = msg.sender;
         p.drawingId = drawingId;
-        p.totalShares = totalShares;
         p.reserveBps = reserveBps;
-        p.salesCloseTime = salesCloseTime;
+        p.totalShares = TOTAL_SHARES;
         p.state = State.Building;
-
         history[msg.sender].push(drawingId);
-        emit PoolCreated(msg.sender, drawingId, totalShares, reserveBps, salesCloseTime, name);
+        emit PoolCreated(msg.sender, drawingId, reserveBps, name);
+
+        // Buy the initial tickets atomically, in chunks of <= MEGAPOT_MAX_BATCH.
+        uint256 remaining = ticketCount;
+        while (remaining > 0) {
+            uint256 chunk = remaining > MEGAPOT_MAX_BATCH ? MEGAPOT_MAX_BATCH : remaining;
+            _addRandomChunk(p, drawingId, chunk);
+            remaining -= chunk;
+        }
     }
 
     /// @notice Buy `tickets` explicit-pick Megapot tickets (1..10) and add them to the pool.
@@ -334,16 +321,20 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     ///         them to the pool. Same funding + referral-sweep flow as {addTickets}.
     function addRandomTickets(uint256 drawingId, uint256 count) external nonReentrant whenNotPaused {
         if (count == 0 || count > MEGAPOT_MAX_BATCH) revert InvalidTicketCount();
-
         Pool storage p = _buildingPool(drawingId, count);
-        uint256 cost = _pullTicketFunding(p, drawingId, count);
+        _addRandomChunk(p, drawingId, count);
+    }
 
+    /// @dev Buy `count` (1..MEGAPOT_MAX_BATCH) quick-pick tickets and add them to the Building pool,
+    ///      reusing the standard funding + sales-fee accounting. Caller checks the pool cap + open
+    ///      drawing (createPool bounds the total up front; addRandomTickets via _buildingPool).
+    function _addRandomChunk(Pool storage p, uint256 drawingId, uint256 count) internal {
+        uint256 cost = _pullTicketFunding(p, drawingId, count);
         (address[] memory referrers, uint256[] memory split) = _selfReferral();
         uint256[] memory ids = RANDOM_BUYER.buyTickets(count, address(this), referrers, split, SOURCE);
         for (uint256 i = 0; i < ids.length; i++) {
             p.ticketIds.push(ids[i]);
         }
-
         _afterTicketBuy(p, drawingId, count, cost);
     }
 
@@ -420,17 +411,19 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         _buyShares(organizer, drawingId, amount, recipient);
     }
 
-    /// @dev Shared share-purchase logic. `holder` is credited the shares; USDC is always
-    ///      pulled from msg.sender. The explicit (organizer, drawingId) key plus the Live +
-    ///      salesClose checks are the stale-pointer guard: a buy can only ever land on the
-    ///      intended, immutable-after-lock pool, and reverts on any state/time transition
-    ///      rather than misapplying.
+    /// @dev Shared share-purchase logic. `holder` is credited the shares; USDC is always pulled
+    ///      from msg.sender. The explicit (organizer, drawingId) key plus the Live + drawing-open
+    ///      checks are the stale-pointer guard: a buy can only ever land on the intended,
+    ///      immutable-after-lock pool, and reverts on any state/drawing transition.
     function _buyShares(address organizer, uint256 drawingId, uint256 amount, address holder) internal {
         if (amount == 0) revert ZeroAmount();
 
         Pool storage p = _pool(organizer, drawingId);
         if (p.state != State.Live) revert WrongState();
-        if (block.timestamp >= p.salesCloseTime) revert SalesClosed();
+        // Shares sell right up until the Megapot drawing closes. No stored cutoff — gate on live
+        // drawing state: reject once drawingTime is reached or the drawing has been drawn.
+        IJackpot.DrawingState memory ds = JACKPOT.getDrawingState(drawingId);
+        if (block.timestamp >= ds.drawingTime || ds.winningTicket != 0) revert SalesClosed();
         if (p.sharesSold + amount > p.sharesForSale) revert ExceedsForSale();
 
         uint256 cost = amount * p.pricePerShare;
@@ -701,7 +694,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
             uint256 sharesSold,
             uint256 reserveShares,
             uint256 ticketCount,
-            uint64 salesCloseTime,
             uint256 pricePerShare,
             uint256 ticketFunding,
             uint256 totalWinnings,
@@ -717,7 +709,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
             p.sharesSold,
             p.reserveShares,
             p.ticketCount,
-            p.salesCloseTime,
             p.pricePerShare,
             p.ticketFunding,
             p.totalWinnings,
