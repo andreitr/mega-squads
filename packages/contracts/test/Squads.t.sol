@@ -256,6 +256,30 @@ contract SquadsTest is Test {
         squads.addTickets(drawingId, _picks(1));
     }
 
+    function test_LargePoolViaRepeatedAddTickets() public {
+        _createPool(organizer, 100);
+        _addTickets(organizer, 10);
+        _addTickets(organizer, 10);
+        _addTickets(organizer, 10); // 30 tickets via repeated <=10 synchronous buys
+
+        (,,,,,, uint256 ticketCount,,, uint256 ticketFunding,,) = squads.getPool(organizer, drawingId);
+        assertEq(ticketCount, 30);
+        assertEq(ticketFunding, 30 * TICKET_PRICE);
+        assertEq(squads.getTicketIds(organizer, drawingId).length, 30);
+
+        // ...and the pool settles normally.
+        _lock(organizer);
+        _buy(alice, organizer, 98);
+        _settle();
+        uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
+        _setWinner(ids[0], 1, 100 * TICKET_PRICE);
+        squads.claimAndDistribute(organizer, drawingId);
+
+        (Squads.State state,,,,,,,,,,,) = squads.getPool(organizer, drawingId);
+        assertEq(uint256(state), uint256(Squads.State.Settled));
+        _assertSolvent();
+    }
+
     // ---------------------------------------------------------------------
     // lock
     // ---------------------------------------------------------------------
