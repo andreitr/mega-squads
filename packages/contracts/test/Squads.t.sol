@@ -30,6 +30,16 @@ contract SquadsTest is Test {
 
     uint256 internal drawingId; // the open drawing pools are created for (1)
 
+    // Mirror of Squads.PoolCreated for vm.expectEmit.
+    event PoolCreated(
+        address indexed organizer,
+        uint256 indexed drawingId,
+        uint256 totalShares,
+        uint256 reserveBps,
+        uint64 salesCloseTime,
+        string name
+    );
+
     function setUp() public {
         vm.warp(1_700_000_000); // realistic timestamp so drawingTime math never underflows
 
@@ -132,6 +142,15 @@ contract SquadsTest is Test {
         jackpot.accrueReferral(address(squads), amount);
     }
 
+    /// @dev A name of exactly `n` bytes (single-byte 'a' chars).
+    function _nameOfBytes(uint256 n) internal pure returns (string memory) {
+        bytes memory b = new bytes(n);
+        for (uint256 i; i < n; i++) {
+            b[i] = "a";
+        }
+        return string(b);
+    }
+
     // ---------------------------------------------------------------------
     // createPool
     // ---------------------------------------------------------------------
@@ -187,6 +206,54 @@ contract SquadsTest is Test {
         vm.prank(organizer);
         vm.expectRevert(Squads.InvalidShares.selector);
         squads.createPool(drawingId, tooMany, DEFAULT_RESERVE_BPS, _closeTime(), "huge");
+    }
+
+    // ---------------------------------------------------------------------
+    // createPool name (bounded bytes, event-only metadata)
+    // ---------------------------------------------------------------------
+
+    function test_CreatePoolAcceptsNormalName() public {
+        uint64 close = _closeTime();
+        vm.expectEmit(true, true, false, true, address(squads));
+        emit PoolCreated(organizer, drawingId, 100, DEFAULT_RESERVE_BPS, close, "Friday Degens");
+        vm.prank(organizer);
+        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, close, "Friday Degens");
+        assertTrue(squads.poolExists(organizer, drawingId));
+    }
+
+    function test_CreatePoolAcceptsEmptyName() public {
+        vm.prank(organizer);
+        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), ""); // frontend supplies a default
+        assertTrue(squads.poolExists(organizer, drawingId));
+    }
+
+    function test_CreatePoolAcceptsMaxLengthName() public {
+        string memory name = _nameOfBytes(64); // exactly MAX_NAME_BYTES
+        assertEq(bytes(name).length, 64);
+        vm.prank(organizer);
+        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), name);
+        assertTrue(squads.poolExists(organizer, drawingId));
+    }
+
+    function test_CreatePoolRevertsOnTooLongName() public {
+        string memory name = _nameOfBytes(65); // MAX_NAME_BYTES + 1
+        vm.prank(organizer);
+        vm.expectRevert(Squads.NameTooLong.selector);
+        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), name);
+    }
+
+    function test_CreatePoolNameNotInStorage() public {
+        // The name is display metadata only: emitted in PoolCreated, never written to the Pool
+        // struct. getPool()'s return tuple is all scalars — there is no name field to read. (If a
+        // name had been stored, the tuple would include it and this 12-field destructuring would
+        // not compile.) Confirms the name costs no storage slot.
+        vm.prank(organizer);
+        squads.createPool(drawingId, 100, DEFAULT_RESERVE_BPS, _closeTime(), "a stored name would waste a slot");
+
+        (Squads.State state, bool soldOut, uint256 totalShares,,,,,,,,,) = squads.getPool(organizer, drawingId);
+        assertEq(uint256(state), uint256(Squads.State.Building));
+        assertEq(totalShares, 100);
+        assertFalse(soldOut);
     }
 
     // ---------------------------------------------------------------------

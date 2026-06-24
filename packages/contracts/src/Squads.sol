@@ -107,6 +107,13 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     /// @notice Integration source tag for Megapot analytics (keccak256 of the app name).
     bytes32 public constant SOURCE = keccak256("squads");
 
+    /// @notice Max byte length of a pool name. Anti-griefing ceiling only — stops a caller
+    ///         bloating calldata / log size with a huge string. The real UX limit (character
+    ///         count, content rules, trimming) is enforced in the frontend; this is just the
+    ///         hard cap that protects the chain. Bytes, not characters: an emoji is up to 4 bytes.
+    ///         The name is display metadata only — emitted in PoolCreated, never stored or read.
+    uint256 internal constant MAX_NAME_BYTES = 64;
+
     // -----------------------------------------------------------------------
     // Immutables
     // -----------------------------------------------------------------------
@@ -216,6 +223,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     error ZeroAddress();
     error InvalidShares();
     error InvalidReserve();
+    error NameTooLong();
     error InvalidTicketCount();
     error TooManyTickets();
     error PoolExists();
@@ -277,6 +285,7 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         uint64 salesCloseTime,
         string calldata name
     ) external whenNotPaused {
+        if (bytes(name).length > MAX_NAME_BYTES) revert NameTooLong();
         if (totalShares == 0 || totalShares > MAX_TOTAL_SHARES) revert InvalidShares();
         // Reserve must leave at least one share to sell; 100%+ is not a pool. (reserveBps strictly
         // below 100% guarantees sharesForSale >= 1, since floor(totalShares*reserveBps/BPS) < totalShares.)
