@@ -7,6 +7,12 @@ packages/contracts/broadcast/
 node_modules/
 .pnpm-store/
 
+# Next.js / web build
+packages/web/.next/
+packages/web/out/
+*.tsbuildinfo
+next-env.d.ts
+
 # Env / secrets
 .env
 .env.*
