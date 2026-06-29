@@ -91,6 +91,12 @@ contract SquadsTest is Test {
         squads.createPool(drawingId, ticketCount, reserveBps, "My Squad");
     }
 
+    /// @dev Create a pool from `n` explicit-pick tickets (the custom-numbers entrypoint).
+    function _createPoolPicks(address org, uint256 n, uint256 reserveBps) internal {
+        vm.prank(org);
+        squads.createPoolWithTickets(drawingId, _picks(n), reserveBps, "My Squad");
+    }
+
     function _addTickets(address org, uint256 n) internal {
         vm.prank(org);
         squads.addTickets(drawingId, _picks(n));
@@ -228,6 +234,51 @@ contract SquadsTest is Test {
         vm.prank(organizer);
         vm.expectRevert(Squads.TooManyTickets.selector); // MAX_POOL_TICKETS = 100
         squads.createPool(drawingId, 101, DEFAULT_RESERVE_BPS, "huge");
+    }
+
+    function test_CreatePoolWithTicketsBuysExplicitPicks() public {
+        // 12 explicit picks -> bought in two Megapot chunks (10 + 2), atomically at creation.
+        _createPoolPicks(organizer, 12, DEFAULT_RESERVE_BPS);
+
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Building));
+        assertEq(_ticketCount(organizer), 12);
+        assertEq(_ticketFunding(organizer), 12 * TICKET_PRICE);
+        assertEq(squads.getTicketIds(organizer, drawingId).length, 12);
+        // Sales fee collected atomically, same as the quick-pick path.
+        assertEq(_feesCollected(organizer), (12 * TICKET_PRICE * FEE_RATE) / 1e18);
+        _assertSolvent();
+
+        // ...and the pool runs the normal lifecycle.
+        _lock(organizer);
+        _buy(alice, organizer, DEFAULT_FOR_SALE); // sold out
+        _settle();
+        uint256[] memory ids = squads.getTicketIds(organizer, drawingId);
+        _setWinner(ids[0], 1, 100 * TICKET_PRICE);
+        squads.claimAndDistribute(organizer, drawingId);
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Settled));
+        assertGt(squads.claimableOf(organizer, drawingId, alice), 0);
+        _assertSolvent();
+    }
+
+    function test_CreatePoolWithTicketsRevertsOnZero() public {
+        vm.prank(organizer);
+        vm.expectRevert(Squads.NoTickets.selector);
+        squads.createPoolWithTickets(drawingId, _picks(0), DEFAULT_RESERVE_BPS, "empty");
+    }
+
+    function test_CreatePoolWithTicketsRevertsOverCap() public {
+        IJackpot.Ticket[] memory many = _picks(101);
+        vm.prank(organizer);
+        vm.expectRevert(Squads.TooManyTickets.selector);
+        squads.createPoolWithTickets(drawingId, many, DEFAULT_RESERVE_BPS, "huge");
+    }
+
+    function test_CreatePoolWithTicketsRevertsOnTooLongName() public {
+        IJackpot.Ticket[] memory t = _picks(3);
+        string memory name = _nameOfBytes(65);
+        vm.prank(organizer);
+        vm.expectRevert(Squads.NameTooLong.selector);
+        squads.createPoolWithTickets(drawingId, t, DEFAULT_RESERVE_BPS, name);
     }
 
     function test_CreatePool_revertsOnDuplicate() public {

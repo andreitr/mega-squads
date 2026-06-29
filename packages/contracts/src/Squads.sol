@@ -271,12 +271,68 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         nonReentrant
         whenNotPaused
     {
-        if (bytes(name).length > MAX_NAME_BYTES) revert NameTooLong();
         if (ticketCount == 0) revert NoTickets();
         if (ticketCount > MAX_POOL_TICKETS) revert TooManyTickets();
+
+        Pool storage p = _createPoolHeader(drawingId, reserveBps, name);
+
+        // Buy the initial quick-pick tickets atomically, in chunks of <= MEGAPOT_MAX_BATCH.
+        uint256 remaining = ticketCount;
+        while (remaining > 0) {
+            uint256 chunk = remaining > MEGAPOT_MAX_BATCH ? MEGAPOT_MAX_BATCH : remaining;
+            _addRandomChunk(p, drawingId, chunk);
+            remaining -= chunk;
+        }
+    }
+
+    /// @notice Create a pool and buy its initial EXPLICIT-PICK tickets atomically — identical to
+    ///         {createPool} but the organizer supplies the numbers (each ticket is 5 normals + a
+    ///         bonusball) instead of a quick-pick count. Picks are forwarded to Megapot, which
+    ///         validates them and reverts on anything out of range. More tickets can still be added
+    ///         during Building via {addTickets} / {addRandomTickets}.
+    /// @param drawingId  Must equal Megapot's current (open) drawing id.
+    /// @param tickets    1..MAX_POOL_TICKETS explicit picks. Bought in chunks of MEGAPOT_MAX_BATCH;
+    ///                   pulls tickets.length * ticketPrice USDC.
+    /// @param reserveBps Reserve carve-out, basis points, 0 allowed, < 100%.
+    /// @param name       Display name; emitted only, never stored. <= MAX_NAME_BYTES bytes.
+    function createPoolWithTickets(
+        uint256 drawingId,
+        IJackpot.Ticket[] calldata tickets,
+        uint256 reserveBps,
+        string calldata name
+    ) external nonReentrant whenNotPaused {
+        uint256 count = tickets.length;
+        if (count == 0) revert NoTickets();
+        if (count > MAX_POOL_TICKETS) revert TooManyTickets();
+
+        Pool storage p = _createPoolHeader(drawingId, reserveBps, name);
+
+        // Buy the explicit picks atomically, in chunks of <= MEGAPOT_MAX_BATCH (Megapot caps a
+        // single buyTickets call at MEGAPOT_MAX_BATCH).
+        uint256 bought = 0;
+        while (bought < count) {
+            uint256 chunkSize = count - bought;
+            if (chunkSize > MEGAPOT_MAX_BATCH) chunkSize = MEGAPOT_MAX_BATCH;
+            IJackpot.Ticket[] memory chunk = new IJackpot.Ticket[](chunkSize);
+            for (uint256 i = 0; i < chunkSize; i++) {
+                chunk[i] = tickets[bought + i];
+            }
+            _addPicksChunk(p, drawingId, chunk);
+            bought += chunkSize;
+        }
+    }
+
+    /// @dev Shared create-pool setup: validate name + reserve, require no existing pool on the open
+    ///      drawing, initialize fields (totalShares fixed to TOTAL_SHARES), record history, and emit
+    ///      PoolCreated. The caller then buys the initial tickets (quick-pick or explicit).
+    function _createPoolHeader(uint256 drawingId, uint256 reserveBps, string calldata name)
+        internal
+        returns (Pool storage p)
+    {
+        if (bytes(name).length > MAX_NAME_BYTES) revert NameTooLong();
         if (reserveBps >= BPS_DENOMINATOR) revert InvalidReserve();
 
-        Pool storage p = pools[_key(msg.sender, drawingId)];
+        p = pools[_key(msg.sender, drawingId)];
         if (p.state != State.None) revert PoolExists();
         if (drawingId != JACKPOT.currentDrawingId()) revert DrawingNotOpen();
 
@@ -287,14 +343,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         p.state = State.Building;
         history[msg.sender].push(drawingId);
         emit PoolCreated(msg.sender, drawingId, reserveBps, name);
-
-        // Buy the initial tickets atomically, in chunks of <= MEGAPOT_MAX_BATCH.
-        uint256 remaining = ticketCount;
-        while (remaining > 0) {
-            uint256 chunk = remaining > MEGAPOT_MAX_BATCH ? MEGAPOT_MAX_BATCH : remaining;
-            _addRandomChunk(p, drawingId, chunk);
-            remaining -= chunk;
-        }
     }
 
     /// @notice Buy `tickets` explicit-pick Megapot tickets (1..10) and add them to the pool.
@@ -332,6 +380,19 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         uint256 cost = _pullTicketFunding(p, drawingId, count);
         (address[] memory referrers, uint256[] memory split) = _selfReferral();
         uint256[] memory ids = RANDOM_BUYER.buyTickets(count, address(this), referrers, split, SOURCE);
+        for (uint256 i = 0; i < ids.length; i++) {
+            p.ticketIds.push(ids[i]);
+        }
+        _afterTicketBuy(p, drawingId, count, cost);
+    }
+
+    /// @dev Buy a chunk of explicit-pick tickets (<= MEGAPOT_MAX_BATCH) via the Jackpot's buyTickets
+    ///      and add them to the Building pool. Same funding + sales-fee accounting as the random path.
+    function _addPicksChunk(Pool storage p, uint256 drawingId, IJackpot.Ticket[] memory chunk) internal {
+        uint256 count = chunk.length;
+        uint256 cost = _pullTicketFunding(p, drawingId, count);
+        (address[] memory referrers, uint256[] memory split) = _selfReferral();
+        uint256[] memory ids = JACKPOT.buyTickets(chunk, address(this), referrers, split, SOURCE);
         for (uint256 i = 0; i < ids.length; i++) {
             p.ticketIds.push(ids[i]);
         }
