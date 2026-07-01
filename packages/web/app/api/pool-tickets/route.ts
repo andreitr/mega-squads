@@ -11,7 +11,7 @@ import { SQUADS_ADDRESS } from "@/lib/addresses";
 const API_BASE = "https://api.megapot.io/v1";
 const MAX_PAGES = 30; // 30 × 100 = up to 3000 tickets scanned
 
-type TicketNumbers = { normals: number[]; bonusball: number; txHash?: string };
+type TicketNumbers = { normals: number[]; bonusball: number; txHash?: string; winnings?: string };
 
 export async function POST(req: Request) {
   let body: { drawingId?: string | number; ids?: string[] };
@@ -45,14 +45,23 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: `Data API ${res.status}`, tickets: found }, { status: 502 });
       }
       const json = (await res.json()) as {
-        data: Array<{ user_ticket_id: string; normals: number[]; bonusball: number; tx_hash?: string }>;
+        data: Array<{
+          user_ticket_id: string;
+          normals: number[];
+          bonusball: number;
+          tx_hash?: string;
+          winnings_amount?: { amount: string; decimals: number } | null;
+        }>;
         next_cursor: string | null;
         has_more: boolean;
       };
 
       for (const t of json.data ?? []) {
         if (want.has(t.user_ticket_id) && !found[t.user_ticket_id]) {
-          found[t.user_ticket_id] = { normals: t.normals, bonusball: t.bonusball, txHash: t.tx_hash };
+          // winnings_amount is USDC (6 decimals) once the drawing is drawn; null/0 for losers.
+          const raw = t.winnings_amount?.amount;
+          const won = raw && /^\d+$/.test(raw) && raw !== "0" ? raw : undefined;
+          found[t.user_ticket_id] = { normals: t.normals, bonusball: t.bonusball, txHash: t.tx_hash, winnings: won };
         }
       }
       cursor = json.next_cursor;

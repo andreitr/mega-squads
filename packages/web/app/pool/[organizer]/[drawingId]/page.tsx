@@ -6,8 +6,8 @@ import { useParams } from "next/navigation";
 import { type Address, isAddress } from "viem";
 import { ConnectKitButton } from "connectkit";
 import { toast } from "sonner";
-import { useAccount, usePublicClient, useReadContract, useWriteContract } from "wagmi";
-import { base } from "wagmi/chains";
+import { useAccount, useEnsAvatar, useEnsName, usePublicClient, useReadContract, useWriteContract } from "wagmi";
+import { base, mainnet } from "wagmi/chains";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { TopBar } from "@/components/TopBar";
 import { FeeUnlockBar } from "@/components/FeeUnlockBar";
@@ -43,6 +43,7 @@ export default function PoolDetailPage() {
   const { allowance, refetch: refetchUsdc } = useUsdc(address);
   const { name } = usePoolMeta(valid ? organizer : undefined, drawingId);
   const { holders } = usePoolHolders(valid ? organizer : undefined, drawingId);
+  const { data: organizerEns } = useEnsName({ address: valid ? organizer : undefined, chainId: mainnet.id });
 
   const claimableQ = useReadContract({
     chainId: base.id,
@@ -54,7 +55,7 @@ export default function PoolDetailPage() {
   });
 
   const [qty, setQty] = useState(25);
-  const [detailTab, setDetailTab] = useState<"tickets" | "owners">("owners");
+  const [detailTab, setDetailTab] = useState<"tickets" | "owners">("tickets");
   const [busy, setBusy] = useState(false);
 
   if (!valid) return <Shell>Invalid pool.</Shell>;
@@ -153,7 +154,7 @@ export default function PoolDetailPage() {
         <div className="mb-[22px] flex items-start justify-between gap-3">
           <div className="min-w-0">
             <h1 className="m-0 mb-[6px] text-[30px] font-bold tracking-[-0.6px] text-txt">{name?.trim() || "Pool"}</h1>
-            <div className="font-mono text-[13px] text-txt-muted">by {dotAddr(organizer)}</div>
+            <div className="font-mono text-[13px] text-txt-muted">by {organizerEns ?? dotAddr(organizer)}</div>
           </div>
           <button
             onClick={share}
@@ -219,16 +220,12 @@ export default function PoolDetailPage() {
                   <>
                     <div className="flex">
                       {holders.slice(0, 5).map((h, i) => (
-                        <span
+                        <HolderAvatar
                           key={h.address}
-                          className="flex h-[30px] w-[30px] items-center justify-center rounded-full border-2 border-surface font-mono text-[9px] font-bold text-bg"
-                          style={{
-                            marginLeft: i === 0 ? 0 : -9,
-                            background: h.address.toLowerCase() === address?.toLowerCase() ? "#c6ff3a" : AVATAR_COLORS[i % AVATAR_COLORS.length],
-                          }}
-                        >
-                          {h.address.toLowerCase() === address?.toLowerCase() ? "YOU" : h.address.slice(2, 4).toUpperCase()}
-                        </span>
+                          address={h.address}
+                          index={i}
+                          isMe={h.address.toLowerCase() === address?.toLowerCase()}
+                        />
                       ))}
                     </div>
                     <span className="font-mono text-[13px] text-txt-muted">
@@ -284,7 +281,7 @@ export default function PoolDetailPage() {
                   )}
                 </div>
               ) : (
-                <TicketsTab organizer={organizer} drawingId={drawingId} ticketCount={p.ticketCount} />
+                <TicketsTab organizer={organizer} drawingId={drawingId} />
               )}
             </div>
           </div>
@@ -401,6 +398,35 @@ export default function PoolDetailPage() {
   );
 }
 
+// Holder avatar: an ENS avatar when the address has one, otherwise the "YOU"/initials badge.
+// ENS resolves on mainnet (configured in the wagmi client for exactly this).
+function HolderAvatar({ address, index, isMe }: { address: Address; index: number; isMe: boolean }) {
+  const { data: ensName } = useEnsName({ address, chainId: mainnet.id });
+  const { data: ensAvatar } = useEnsAvatar({
+    name: ensName ?? undefined,
+    chainId: mainnet.id,
+    query: { enabled: Boolean(ensName) },
+  });
+  const ring = "h-[30px] w-[30px] shrink-0 rounded-full border-2 border-surface";
+  const marginLeft = index === 0 ? 0 : -9;
+
+  if (ensAvatar) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img src={ensAvatar} alt={ensName ?? address} title={ensName ?? undefined} className={`${ring} object-cover`} style={{ marginLeft }} />
+    );
+  }
+  return (
+    <span
+      className={`${ring} flex items-center justify-center font-mono text-[9px] font-bold text-bg`}
+      style={{ marginLeft, background: isMe ? "#c6ff3a" : AVATAR_COLORS[index % AVATAR_COLORS.length] }}
+      title={ensName ?? address}
+    >
+      {isMe ? "YOU" : address.slice(2, 4).toUpperCase()}
+    </span>
+  );
+}
+
 function Legend({ color, label, border }: { color: string; label: string; border?: boolean }) {
   return (
     <div className="flex items-center gap-[6px]">
@@ -429,12 +455,12 @@ function TabBtn({ active, onClick, children }: { active: boolean; onClick: () =>
   );
 }
 
-type TicketNumbers = { normals: number[]; bonusball: number; txHash?: string };
+type TicketNumbers = { normals: number[]; bonusball: number; txHash?: string; winnings?: string };
 
 // Ticket numbers aren't exposed by any on-chain read, so the picked normals/bonusball come from the
 // Megapot Data API (proxied through /api/pool-tickets to keep the key server-side). The ticket IDs
 // themselves are read on-chain (getTicketIds) and used to look up each ticket's numbers.
-function TicketsTab({ organizer, drawingId, ticketCount }: { organizer: Address; drawingId: bigint; ticketCount: bigint }) {
+function TicketsTab({ organizer, drawingId }: { organizer: Address; drawingId: bigint }) {
   const idsQ = useReadContract({
     chainId: base.id,
     address: SQUADS_ADDRESS,
@@ -462,9 +488,6 @@ function TicketsTab({ organizer, drawingId, ticketCount }: { organizer: Address;
 
   return (
     <div className="px-4">
-      <div className="mb-2 font-mono text-[12px] text-txt-faint">
-        {ticketCount.toString()} ticket{ticketCount === 1n ? "" : "s"} entered in drawing #{drawingId.toString()}
-      </div>
       {ids.length === 0 ? (
         <div className="py-3 text-center font-mono text-[12px] text-txt-faint">Loading tickets…</div>
       ) : (
@@ -486,17 +509,25 @@ function TicketsTab({ organizer, drawingId, ticketCount }: { organizer: Address;
                   {numbersQ.isLoading ? "Loading numbers…" : "Numbers indexing…"}
                 </span>
               )}
-              <a
-                href={verifyHref}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="ml-auto inline-flex items-center gap-1 font-mono text-[12px] font-semibold text-txt-muted hover:text-accent"
-              >
-                Verify
-                <svg width="11" height="11" viewBox="0 0 16 16" aria-hidden>
-                  <path d="M6 3 H13 V10 M13 3 L3 13" stroke="currentColor" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </a>
+              <div className="ml-auto flex items-center gap-3">
+                {n?.winnings && (
+                  <span className="rounded-[6px] bg-accent/[0.14] px-2 py-1 font-mono text-[11px] font-bold text-accent">
+                    Won {formatUsdc(BigInt(n.winnings))}
+                  </span>
+                )}
+                <a
+                  href={verifyHref}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title="Verify on Basescan"
+                  aria-label="Verify on Basescan"
+                  className="inline-flex items-center text-txt-muted hover:text-accent"
+                >
+                  <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
+                    <path d="M6 3 H13 V10 M13 3 L3 13" stroke="currentColor" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </a>
+              </div>
             </div>
           );
         })

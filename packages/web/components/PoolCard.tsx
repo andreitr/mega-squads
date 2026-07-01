@@ -1,10 +1,15 @@
+"use client";
+
 import Link from "next/link";
+import { useEnsName } from "wagmi";
+import { mainnet } from "wagmi/chains";
 import type { LivePool } from "@/lib/hooks";
 import { soldPct } from "@/lib/derive";
 import { dotAddr } from "@/lib/format";
 
 /** Discover-feed pool card — matches the design: title, big ticket count, progress bar, footer. */
 export function PoolCard({ pool }: { pool: LivePool }) {
+  const { data: organizerEns } = useEnsName({ address: pool.organizer, chainId: mainnet.id });
   const building = pool.vis === "building";
   const pct = soldPct(pool);
   const almost = pct >= 85; // "almost gone" → accent fill + accent border
@@ -40,7 +45,7 @@ export function PoolCard({ pool }: { pool: LivePool }) {
         <span className="font-mono text-[10px] font-semibold" style={{ color: soldColor }}>
           {soldLabel}
         </span>
-        <span className="truncate font-mono text-[10px] text-txt-muted">by {dotAddr(pool.organizer)}</span>
+        <span className="truncate font-mono text-[10px] text-txt-muted">by {organizerEns ?? dotAddr(pool.organizer)}</span>
       </div>
     </Link>
   );
