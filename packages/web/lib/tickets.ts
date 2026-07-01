@@ -5,16 +5,31 @@ export type Ticket = { normals: number[]; bonusball: number };
 export const DEFAULT_BALL_MAX = 37;
 export const DEFAULT_BONUSBALL_MAX = 26;
 
+// Fixed count of normal numbers per ticket. The contract exposes ball ranges, not a count.
+export const NORMALS_COUNT = 5;
+
 function randInt(max: number): number {
   return Math.floor(Math.random() * max) + 1; // 1..max
 }
 
-/** A fresh random pick: 5 unique normals (sorted ascending) + a bonusball. */
+/** A fresh random pick: NORMALS_COUNT unique normals (sorted ascending) + a bonusball. */
 export function randomTicket(ballMax = DEFAULT_BALL_MAX, bonusballMax = DEFAULT_BONUSBALL_MAX): Ticket {
   const set = new Set<number>();
-  while (set.size < 5) set.add(randInt(ballMax));
+  while (set.size < NORMALS_COUNT) set.add(randInt(ballMax));
   const normals = [...set].sort((a, b) => a - b);
   return { normals, bonusball: randInt(bonusballMax) };
+}
+
+/** True when a ticket is a complete, in-range pick: NORMALS_COUNT unique normals + one bonusball. */
+export function isCompleteTicket(t: Ticket, ballMax: number, bonusballMax: number): boolean {
+  const unique = new Set(t.normals);
+  return (
+    unique.size === NORMALS_COUNT &&
+    [...unique].every((n) => Number.isInteger(n) && n >= 1 && n <= ballMax) &&
+    Number.isInteger(t.bonusball) &&
+    t.bonusball >= 1 &&
+    t.bonusball <= bonusballMax
+  );
 }
 
 export function pad2(n: number): string {

@@ -446,6 +446,33 @@ contract SquadsTest is Test {
         squads.lock(drawingId);
     }
 
+    function test_CreateWithTicketsAndLock_isImmediatelyLive() public {
+        vm.prank(organizer);
+        squads.createPoolWithTicketsAndLock(drawingId, _picks(5), DEFAULT_RESERVE_BPS, "My Squad");
+
+        // Live in one call — same end state as createPoolWithTickets + lock.
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Live));
+        assertEq(_ticketCount(organizer), 5);
+        assertEq(_totalShares(organizer), TOTAL_SHARES);
+        assertEq(_reserveShares(organizer), 25); // 1000 * 250 / 10000
+        assertEq(_sharesForSale(organizer), DEFAULT_FOR_SALE); // 975
+        assertEq(_pricePerShare(organizer), (5 * TICKET_PRICE) / TOTAL_SHARES);
+        assertEq(squads.sharesOf(organizer, drawingId, organizer), 25); // reserve granted
+
+        // Open for share buys with no separate lock step.
+        _buy(alice, organizer, 3);
+        assertEq(squads.sharesOf(organizer, drawingId, alice), 3);
+        _assertSolvent();
+    }
+
+    function test_CreateWithTicketsAndLock_revertsOnSecondPool() public {
+        vm.startPrank(organizer);
+        squads.createPoolWithTicketsAndLock(drawingId, _picks(2), DEFAULT_RESERVE_BPS, "one");
+        vm.expectRevert(Squads.PoolExists.selector);
+        squads.createPoolWithTicketsAndLock(drawingId, _picks(2), DEFAULT_RESERVE_BPS, "two");
+        vm.stopPrank();
+    }
+
     // ---------------------------------------------------------------------
     // buyShares / buySharesFor
     // ---------------------------------------------------------------------
@@ -607,6 +634,22 @@ contract SquadsTest is Test {
         _buy(alice, organizer, 10);
         vm.expectRevert(Squads.DrawingNotSettled.selector);
         squads.claimAndDistribute(organizer, drawingId);
+    }
+
+    /// @dev The live Jackpot keeps `jackpotLock == true` on every settled drawing (only the open
+    ///      drawing is unlocked). Settlement must succeed regardless — a settled `winningTicket`
+    ///      is proof enough. Guards against reintroducing a jackpotLock gate that would trap funds.
+    function test_Settle_succeedsWhileJackpotLocked() public {
+        _createPool(organizer, 5);
+        _lock(organizer);
+        _buy(alice, organizer, DEFAULT_FOR_SALE);
+        _settle();
+
+        assertTrue(jackpot.getDrawingState(drawingId).jackpotLock, "precondition: settled drawing stays locked");
+
+        squads.claimAndDistribute(organizer, drawingId);
+        assertEq(uint256(_state(organizer)), uint256(Squads.State.Settled));
+        _assertSolvent();
     }
 
     function test_Settle_neverLocked_goesToOrganizer() public {

@@ -9,10 +9,10 @@ import { base, mainnet } from "wagmi/chains";
 // Coinbase Wallet still work; WalletConnect-based wallets won't connect.
 const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || "megapools-dev-placeholder";
 
-// Frontend RPC. Set NEXT_PUBLIC_ALCHEMY_KEY for a dedicated endpoint (the key ships in the client
-// bundle either way), or fall back to the public RPCs. Base = all contract reads/writes; Ethereum
-// mainnet (chain 1) is only for ConnectKit's ENS name/avatar resolution.
-const alchemyKey = process.env.NEXT_PUBLIC_ALCHEMY_KEY;
+// Frontend RPC. Set NEXT_PUBLIC_ALCHEMY_API_KEY for a dedicated endpoint (the key ships in the
+// client bundle either way), or fall back to the public RPCs. Base = all contract reads/writes;
+// Ethereum mainnet (chain 1) is only for ConnectKit's ENS name/avatar resolution.
+const alchemyKey = process.env.NEXT_PUBLIC_ALCHEMY_API_KEY;
 const baseRpcUrl = alchemyKey ? `https://base-mainnet.g.alchemy.com/v2/${alchemyKey}` : "https://mainnet.base.org";
 const mainnetRpcUrl = alchemyKey ? `https://eth-mainnet.g.alchemy.com/v2/${alchemyKey}` : "https://eth.llamarpc.com";
 

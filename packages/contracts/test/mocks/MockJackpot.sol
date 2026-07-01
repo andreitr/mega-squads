@@ -39,6 +39,7 @@ contract MockJackpot {
     struct DrawingData {
         uint256 drawingTime;
         uint256 winningTicket; // 0 until settled
+        bool jackpotLock; // false while open; true once settled (matches the live Jackpot, which never clears it)
         uint256[12] tierPayouts;
         mapping(uint256 => uint256) ticketTier; // megaTicketId => tier (0-11)
         mapping(uint256 => address) ticketOwner;
@@ -168,7 +169,7 @@ contract MockJackpot {
             ballMax: 49,
             bonusballMax: 26,
             payoutCalculator: address(0),
-            jackpotLock: false
+            jackpotLock: dd.jackpotLock
         });
     }
 
@@ -215,6 +216,7 @@ contract MockJackpot {
         DrawingData storage dd = drawingsData[currentDrawingId];
         require(block.timestamp >= dd.drawingTime, "too early");
         dd.winningTicket = 12345; // sentinel non-zero
+        dd.jackpotLock = true; // settled drawings stay locked, exactly like the live Jackpot
         // Advance.
         currentDrawingId += 1;
         drawingsData[currentDrawingId].drawingTime = block.timestamp + drawingDuration;

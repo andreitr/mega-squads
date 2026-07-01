@@ -1,6 +1,8 @@
 "use client";
 
+import { useState } from "react";
 import { type Ticket, randomTicket, pad2 } from "@/lib/tickets";
+import { NumberPicker } from "./NumberPicker";
 
 export function TicketsEditor({
   tickets,
@@ -14,13 +16,17 @@ export function TicketsEditor({
   bonusballMax: number;
 }) {
   const total = tickets.length;
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
 
   const add = () => setTickets([...tickets, randomTicket(ballMax, bonusballMax)]);
-  const reroll = (i: number) =>
-    setTickets(tickets.map((t, j) => (j === i ? randomTicket(ballMax, bonusballMax) : t)));
   const remove = (i: number) => {
     if (tickets.length <= 1) return; // min 1
     setTickets(tickets.filter((_, j) => j !== i));
+  };
+  const saveEdit = (t: Ticket) => {
+    if (editingIndex === null) return;
+    setTickets(tickets.map((cur, j) => (j === editingIndex ? t : cur)));
+    setEditingIndex(null);
   };
 
   return (
@@ -43,7 +49,7 @@ export function TicketsEditor({
               <Ball bonus>{pad2(t.bonusball)}</Ball>
             </div>
             <div className="flex shrink-0 items-center gap-1">
-              <IconBtn title="Re-roll numbers" onClick={() => reroll(i)}>
+              <IconBtn title="Edit numbers" onClick={() => setEditingIndex(i)}>
                 {/* pencil */}
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
@@ -71,6 +77,15 @@ export function TicketsEditor({
         </svg>
         Add ticket
       </button>
+
+      <NumberPicker
+        open={editingIndex !== null}
+        ticket={editingIndex !== null ? tickets[editingIndex] : null}
+        ballMax={ballMax}
+        bonusballMax={bonusballMax}
+        onSave={saveEdit}
+        onClose={() => setEditingIndex(null)}
+      />
     </div>
   );
 }

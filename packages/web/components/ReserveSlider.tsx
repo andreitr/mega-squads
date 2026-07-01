@@ -4,14 +4,10 @@
 export function ReserveSlider({
   value,
   onChange,
-  ticketCount,
 }: {
   value: number; // percent, 0..99
   onChange: (v: number) => void;
-  ticketCount: number;
 }) {
-  const forSalePct = 100 - value;
-  const reimburse = (ticketCount * forSalePct) / 100; // $ repaid on a full sellout (tickets are $1)
   const fillPct = (value / 99) * 100;
 
   return (
@@ -44,16 +40,11 @@ export function ReserveSlider({
             ? "you keep none of the pool. It's all for sale to friends."
             : `you keep ${value % 1 === 0 ? value : value.toFixed(1)}% of the pool. The rest is for sale to friends.`}
         </Bullet>
-        <Bullet lead="Your money back:">
-          as friends buy in, you get repaid — up to ${reimburse % 1 === 0 ? reimburse : reimburse.toFixed(2)} on a full
-          sellout.
-        </Bullet>
+        <Bullet lead="Your money back:">as friends buy in, you get repaid.</Bullet>
         <Bullet lead="The fees:">
           the pool earns a 10% referral fee. Sell out and it's split among shareholders; fall short and you keep it.
         </Bullet>
-        <Bullet lead="If it wins:">
-          a 10% win-share follows the same rule as the fees — split with shareholders if you sell out, otherwise yours.
-        </Bullet>
+        <Bullet lead="If it wins:">you keep 10% of the prize, on top of your stake&apos;s share.</Bullet>
       </div>
     </div>
   );

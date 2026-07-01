@@ -14,6 +14,11 @@ export const USDC_ADDRESS = (env.NEXT_PUBLIC_USDC_ADDRESS ??
 export const JACKPOT_ADDRESS = (env.NEXT_PUBLIC_JACKPOT_ADDRESS ??
   "0x3bAe643002069dBCbcd62B1A4eb4C4A397d042a2") as Address;
 
+// Megapot GuaranteedMinimumPayoutCalculator — computes the per-tier payouts for a drawing. The
+// headline "jackpot" is the top tier (index 11 = 5 normals + bonusball) of getExpectedDrawingTierPayouts.
+export const PAYOUT_CALC_ADDRESS = (env.NEXT_PUBLIC_PAYOUT_CALC_ADDRESS ??
+  "0x97a22361b6208aC8cd9afaea09D20feC47046CBD") as Address;
+
 // Floor block for PoolCreated log queries (the contract's deploy block — keeps getLogs fast and
 // within RPC range limits). 0x76803d…2f2d was created at block 47975349 on Base.
 export const SQUADS_DEPLOY_BLOCK = BigInt(env.NEXT_PUBLIC_SQUADS_DEPLOY_BLOCK ?? "47975349");

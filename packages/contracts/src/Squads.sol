@@ -220,7 +220,6 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
     error WrongState();
     error DrawingNotOpen();
     error DrawingNotSettled();
-    error SettlementInProgress();
     error SalesClosed();
     error ExceedsForSale();
     error NoTickets();
@@ -306,9 +305,37 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         if (count > MAX_POOL_TICKETS) revert TooManyTickets();
 
         Pool storage p = _createPoolHeader(drawingId, reserveBps, name);
+        _buyInitialPicks(p, drawingId, tickets);
+    }
 
-        // Buy the explicit picks atomically, in chunks of <= MEGAPOT_MAX_BATCH (Megapot caps a
-        // single buyTickets call at MEGAPOT_MAX_BATCH).
+    /// @notice Create a pool, buy its explicit-pick tickets, AND lock it Live in a single
+    ///         transaction — equivalent to {createPoolWithTickets} immediately followed by {lock},
+    ///         so the pool is open for share buys the moment it's created (no separate lock step).
+    ///         The reserve is carved out and pricePerShare fixed here, exactly as {lock} does.
+    /// @param drawingId  Must equal Megapot's current (open) drawing id.
+    /// @param tickets    1..MAX_POOL_TICKETS explicit picks (each 5 normals + a bonusball).
+    /// @param reserveBps Reserve carve-out, basis points, 0 allowed, < 100%.
+    /// @param name       Display name; emitted only, never stored. <= MAX_NAME_BYTES bytes.
+    function createPoolWithTicketsAndLock(
+        uint256 drawingId,
+        IJackpot.Ticket[] calldata tickets,
+        uint256 reserveBps,
+        string calldata name
+    ) external nonReentrant whenNotPaused {
+        uint256 count = tickets.length;
+        if (count == 0) revert NoTickets();
+        if (count > MAX_POOL_TICKETS) revert TooManyTickets();
+
+        Pool storage p = _createPoolHeader(drawingId, reserveBps, name);
+        _buyInitialPicks(p, drawingId, tickets);
+        _goLive(p);
+        emit PoolLocked(msg.sender, drawingId, p.ticketFunding, p.pricePerShare, p.sharesForSale, p.reserveShares);
+    }
+
+    /// @dev Buy a freshly created pool's initial explicit picks, in chunks of <= MEGAPOT_MAX_BATCH
+    ///      (Megapot caps a single buyTickets call at MEGAPOT_MAX_BATCH).
+    function _buyInitialPicks(Pool storage p, uint256 drawingId, IJackpot.Ticket[] calldata tickets) internal {
+        uint256 count = tickets.length;
         uint256 bought = 0;
         while (bought < count) {
             uint256 chunkSize = count - bought;
@@ -518,9 +545,12 @@ contract Squads is Ownable2Step, Pausable, ReentrancyGuard {
         }
         if (p.state != State.Live) revert WrongState();
 
+        // `winningTicket != 0` is set by Megapot's entropy callback — the final settlement step —
+        // so it fully proves the drawing is drawn and its winners are claimable. (Do NOT also gate on
+        // jackpotLock: the live Jackpot keeps jackpotLock == true on every settled drawing, so that
+        // check would block settlement forever.)
         IJackpot.DrawingState memory ds = JACKPOT.getDrawingState(drawingId);
         if (ds.winningTicket == 0) revert DrawingNotSettled();
-        if (ds.jackpotLock) revert SettlementInProgress();
 
         // 1. Sold-out determination + assign unsold shares to the organizer, so the full
         //    totalShares is owned and the pro-rata split below is exact.

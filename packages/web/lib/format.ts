@@ -25,6 +25,29 @@ export function shortAddr(a?: string) {
   return `${a.slice(0, 6)}…${a.slice(-4)}`;
 }
 
+// "0x7a2f..9c41" — the design's two-dot address style (mono, used on cards/detail/verify).
+export function dotAddr(a?: string) {
+  if (!a) return "";
+  return `${a.slice(0, 6)}..${a.slice(-4)}`;
+}
+
+// Megapot jackpot headline: whole-dollar with thousands separators, e.g. 250776_123456n -> "$250,776".
+export function jackpotUsd(v: bigint | undefined | null) {
+  if (v === undefined || v === null) return "$—";
+  const whole = v / 10n ** BigInt(USDC_DECIMALS);
+  return `$${whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
+}
+
+// "HH:MM:SS" countdown to a unix-seconds deadline; clamps at 0. For the jackpot / drawing timer.
+export function hms(deadline: bigint | undefined | null, nowMs: number) {
+  if (!deadline || deadline === 0n) return "00:00:00";
+  const diff = Math.max(0, Number(deadline) - Math.floor(nowMs / 1000));
+  const h = Math.floor(diff / 3600);
+  const m = Math.floor((diff % 3600) / 60);
+  const s = diff % 60;
+  return [h, m, s].map((n) => n.toString().padStart(2, "0")).join(":");
+}
+
 // "in 6h 12m 03s" / "closed 0h 04m ago" — for the Megapot drawing time.
 export function countdown(deadline: bigint | undefined | null, now: number) {
   if (!deadline || deadline === 0n) return { label: "—", ended: true };

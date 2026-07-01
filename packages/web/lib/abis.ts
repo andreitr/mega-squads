@@ -24,6 +24,19 @@ export const squadsAbi = [
     outputs: [],
   },
   {
+    // Create + buy tickets + lock (go Live) in one transaction — pool is buyable immediately.
+    type: "function",
+    name: "createPoolWithTicketsAndLock",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "drawingId", type: "uint256" },
+      { name: "tickets", type: "tuple[]", components: ticketTuple.components },
+      { name: "reserveBps", type: "uint256" },
+      { name: "name", type: "string" },
+    ],
+    outputs: [],
+  },
+  {
     type: "function",
     name: "createPool",
     stateMutability: "nonpayable",
@@ -260,6 +273,22 @@ export const jackpotAbi = [
         ],
       },
     ],
+  },
+] as const;
+
+export const payoutCalcAbi = [
+  {
+    type: "function",
+    name: "getExpectedDrawingTierPayouts",
+    stateMutability: "view",
+    inputs: [
+      { name: "_drawingId", type: "uint256" },
+      { name: "_prizePool", type: "uint256" },
+      { name: "_normalMax", type: "uint8" },
+      { name: "_bonusballMax", type: "uint8" },
+    ],
+    // index 11 (5 normals + bonusball) is the jackpot tier; indices 0 and 2 are non-paying (0).
+    outputs: [{ name: "drawingTierPayouts", type: "uint256[12]" }],
   },
 ] as const;
 
