@@ -54,6 +54,20 @@ export default function PoolDetailPage() {
     query: { enabled: Boolean(address) && valid, refetchInterval: 15_000 },
   });
 
+  // The drawing's winning numbers (Data API, via /api/round) — for the settled card.
+  const roundQ = useQuery({
+    queryKey: ["round-info", drawingId?.toString() ?? "none"],
+    enabled: valid,
+    queryFn: async (): Promise<{ status: string | null; settledAt: string | null; winningNumbers: { normals: number[]; bonusball: number } | null }> => {
+      const res = await fetch(`/api/round?drawingId=${drawingId}`);
+      if (!res.ok) throw new Error(`round ${res.status}`);
+      return res.json();
+    },
+  });
+  const settledDate = roundQ.data?.settledAt
+    ? new Date(roundQ.data.settledAt).toLocaleDateString("en-US", { month: "long", day: "numeric" })
+    : null;
+
   const [qty, setQty] = useState(25);
   const [detailTab, setDetailTab] = useState<"tickets" | "owners">("tickets");
   const [busy, setBusy] = useState(false);
@@ -77,6 +91,13 @@ export default function PoolDetailPage() {
   const claimable = (claimableQ.data as bigint | undefined) ?? 0n;
   const onBase = chainId === base.id;
   const drawn = ds?.winningTicket !== undefined && ds.winningTicket !== 0n;
+
+  // Settled-card state: whether the pool won, and how the claim splits into pro-rata winnings vs
+  // the referral-fee rebate (claimable also bundles the rebate, so winnings is the share-based part).
+  const won = p.totalWinnings > 0n;
+  const myShares = holders.find((h) => h.address.toLowerCase() === address?.toLowerCase())?.shares ?? 0n;
+  const myWinnings = p.totalShares > 0n ? (p.totalWinnings * myShares) / p.totalShares : 0n;
+  const rebate = claimable > myWinnings ? claimable - myWinnings : 0n;
   const reservePctNum = p.totalShares > 0n ? (Number(p.reserveShares) / Number(p.totalShares)) * 100 : 0;
   const sliderFill = `${((cappedQty - 1) / Math.max(1, buyMax - 1)) * 100}%`;
 
@@ -184,19 +205,19 @@ export default function PoolDetailPage() {
                   </span>
                   <span className="pb-[6px] font-mono text-[15px] text-txt-muted">sold</span>
                 </div>
-                <span
-                  className="inline-flex items-center gap-[7px] rounded-[8px] px-[11px] py-[6px] font-mono text-[11px] font-bold uppercase tracking-[0.5px]"
-                  style={{ background: meta.tint, color: meta.color }}
-                >
-                  <span className="h-[6px] w-[6px] rounded-full" style={{ background: meta.color }} />
-                  {vis === "live"
-                    ? `Drawing in ${hms(ds?.drawingTime, now)}`
-                    : vis === "locked"
-                      ? "Sales closed"
-                      : vis === "building"
-                        ? "Funding"
-                        : "Drawn"}
-                </span>
+                {vis !== "settled" && (
+                  <span
+                    className="inline-flex items-center gap-[7px] rounded-[8px] px-[11px] py-[6px] font-mono text-[11px] font-bold uppercase tracking-[0.5px]"
+                    style={{ background: meta.tint, color: meta.color }}
+                  >
+                    <span className="h-[6px] w-[6px] rounded-full" style={{ background: meta.color }} />
+                    {vis === "live"
+                      ? `Drawing in ${hms(ds?.drawingTime, now)}`
+                      : vis === "locked"
+                        ? "Sales closed"
+                        : "Funding"}
+                  </span>
+                )}
               </div>
               <div className="mb-[18px] font-mono text-[12px] text-txt-faint">
                 {p.ticketCount.toString()} tickets · {forSale} shares
@@ -288,16 +309,6 @@ export default function PoolDetailPage() {
 
           {/* RIGHT (sticky) */}
           <div className="flex flex-col gap-4 lg:sticky lg:top-[90px]">
-            {claimable > 0n && (
-              <button
-                disabled={busy}
-                onClick={() => action("withdraw", "Withdraw")}
-                className="rounded-[15px] bg-accent py-4 text-[15px] font-bold text-bg disabled:opacity-60"
-              >
-                Claim {formatUsdc(claimable)}
-              </button>
-            )}
-
             {vis === "live" && (
               <div className="flex min-h-[299px] flex-col justify-center gap-[22px] rounded-[20px] border border-white/[0.07] bg-surface px-5 py-6">
                 <div className="text-center">
@@ -367,14 +378,54 @@ export default function PoolDetailPage() {
               </div>
             )}
 
-            {vis === "settled" && claimable <= 0n && (
-              <div className="flex min-h-[299px] flex-col items-center justify-center rounded-[20px] border border-white/[0.07] bg-surface p-6 text-center">
-                <div className="mb-2 text-[30px]">🎲</div>
-                <div className="mb-[6px] text-[17px] font-bold text-txt">This pool is settled</div>
-                <div className="mb-4 text-[13px] leading-[1.5] text-txt-muted">Winnings (if any) have been distributed to shareholders.</div>
-                <Link href="/" className="w-full rounded-[13px] bg-accent py-[14px] text-[14px] font-bold text-bg">
-                  Find your next pool
-                </Link>
+            {vis === "settled" && (
+              <div
+                className="flex min-h-[299px] flex-col items-center rounded-[22px] px-[26px] py-7 text-center"
+                style={
+                  won
+                    ? {
+                        background: "radial-gradient(120% 90% at 50% 0%, rgba(198,255,58,0.16), #12100e 58%)",
+                        border: "1px solid rgba(198,255,58,0.4)",
+                      }
+                    : { background: "#12100e", border: "1px solid rgba(255,255,255,0.08)" }
+                }
+              >
+                {/* Header pinned top, button pinned bottom, amount + caption centered between. */}
+                <a
+                  href={`https://megapot.io/results/${drawingId}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-[6px] font-mono text-[11px] uppercase tracking-[2px] text-[#7d7669] hover:text-txt"
+                >
+                  Round settled{settledDate ? ` on ${settledDate}` : ""}
+                  <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden>
+                    <path d="M6 3 H13 V10 M13 3 L3 13" stroke="currentColor" strokeWidth="1.8" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </a>
+
+                <div className="flex flex-1 flex-col items-center justify-center">
+                  <div
+                    className="font-mono text-[53px] font-bold leading-[0.85] tracking-[-2.5px]"
+                    style={won ? { color: "#c6ff3a", textShadow: "0 0 30px rgba(198,255,58,0.35)" } : { color: "#f4f1ea" }}
+                  >
+                    {formatUsdc(claimable)}
+                  </div>
+                  <div className="mt-3 font-mono text-[11px] uppercase tracking-[1.6px] text-[#7d7669]">
+                    {claimable > 0n
+                      ? won
+                        ? `${formatUsdc(myWinnings)} winnings + ${formatUsdc(rebate)} rebate`
+                        : `Referral rebate${p.soldOut ? " · pool sold out" : ""}`
+                      : "Nothing to claim"}
+                  </div>
+                </div>
+
+                <button
+                  disabled={busy || claimable <= 0n}
+                  onClick={() => action("withdraw", "Withdraw")}
+                  className="w-full rounded-[16px] bg-accent p-[17px] text-[17px] font-bold text-bg hover:brightness-105 disabled:opacity-60"
+                >
+                  {claimable > 0n ? `Claim ${formatUsdc(claimable)}` : "Nothing to claim"}
+                </button>
               </div>
             )}
 
@@ -457,34 +508,39 @@ function TabBtn({ active, onClick, children }: { active: boolean; onClick: () =>
 
 type TicketNumbers = { normals: number[]; bonusball: number; txHash?: string; winnings?: string };
 
-// Ticket numbers aren't exposed by any on-chain read, so the picked normals/bonusball come from the
-// Megapot Data API (proxied through /api/pool-tickets to keep the key server-side). The ticket IDs
-// themselves are read on-chain (getTicketIds) and used to look up each ticket's numbers.
-function TicketsTab({ organizer, drawingId }: { organizer: Address; drawingId: bigint }) {
+// Ticket numbers aren't exposed by any on-chain read, so the picked normals/bonusball (and any
+// winnings) come from the Megapot Data API (proxied through /api/pool-tickets to keep the key
+// server-side). The ticket IDs themselves are read on-chain (getTicketIds). Shared by the Tickets
+// tab and the settled card — the identical query keys dedupe into one fetch.
+function usePoolTicketNumbers(organizer?: Address, drawingId?: bigint) {
   const idsQ = useReadContract({
     chainId: base.id,
     address: SQUADS_ADDRESS,
     abi: squadsAbi,
     functionName: "getTicketIds",
-    args: [organizer, drawingId],
-    query: { refetchInterval: 30_000 },
+    args: organizer && drawingId !== undefined ? [organizer, drawingId] : undefined,
+    query: { enabled: Boolean(organizer) && drawingId !== undefined, refetchInterval: 30_000 },
   });
   const ids = useMemo(() => ((idsQ.data as readonly bigint[] | undefined) ?? []).map((id) => id.toString()), [idsQ.data]);
 
   const numbersQ = useQuery({
-    queryKey: ["pool-ticket-numbers", drawingId.toString(), ids],
-    enabled: ids.length > 0,
+    queryKey: ["pool-ticket-numbers", drawingId?.toString() ?? "none", ids],
+    enabled: ids.length > 0 && drawingId !== undefined,
     queryFn: async (): Promise<Record<string, TicketNumbers>> => {
       const res = await fetch("/api/pool-tickets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ drawingId: drawingId.toString(), ids }),
+        body: JSON.stringify({ drawingId: drawingId!.toString(), ids }),
       });
       if (!res.ok) throw new Error(`tickets ${res.status}`);
       return (await res.json()).tickets ?? {};
     },
   });
-  const numbers = numbersQ.data ?? {};
+  return { ids, numbers: numbersQ.data ?? ({} as Record<string, TicketNumbers>), isLoading: numbersQ.isLoading };
+}
+
+function TicketsTab({ organizer, drawingId }: { organizer: Address; drawingId: bigint }) {
+  const { ids, numbers, isLoading } = usePoolTicketNumbers(organizer, drawingId);
 
   return (
     <div className="px-4">
@@ -501,33 +557,31 @@ function TicketsTab({ organizer, drawingId }: { organizer: Address; drawingId: b
                   {n.normals.map((num, k) => (
                     <Ball key={k}>{pad2(num)}</Ball>
                   ))}
-                  <span className="text-[16px] font-semibold text-[#5c574e]">–</span>
+                  <span className="text-[14px] font-semibold text-[#5c574e]">–</span>
                   <Ball bonus>{pad2(n.bonusball)}</Ball>
                 </>
               ) : (
                 <span className="flex-1 font-mono text-[12px] text-txt-faint">
-                  {numbersQ.isLoading ? "Loading numbers…" : "Numbers indexing…"}
+                  {isLoading ? "Loading numbers…" : "Numbers indexing…"}
                 </span>
               )}
-              <div className="ml-auto flex items-center gap-3">
-                {n?.winnings && (
-                  <span className="rounded-[6px] bg-accent/[0.14] px-2 py-1 font-mono text-[11px] font-bold text-accent">
-                    Won {formatUsdc(BigInt(n.winnings))}
-                  </span>
-                )}
-                <a
-                  href={verifyHref}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  title="Verify on Basescan"
-                  aria-label="Verify on Basescan"
-                  className="inline-flex items-center text-txt-muted hover:text-accent"
-                >
-                  <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
-                    <path d="M6 3 H13 V10 M13 3 L3 13" stroke="currentColor" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                </a>
-              </div>
+              {n?.winnings && (
+                <span className="rounded-[6px] bg-accent/[0.14] px-2 py-1 font-mono text-[11px] font-bold text-accent">
+                  Won {formatUsdc(BigInt(n.winnings))}
+                </span>
+              )}
+              <a
+                href={verifyHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Verify on Basescan"
+                aria-label="Verify on Basescan"
+                className="ml-auto inline-flex items-center text-txt-muted hover:text-accent"
+              >
+                <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
+                  <path d="M6 3 H13 V10 M13 3 L3 13" stroke="currentColor" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </a>
             </div>
           );
         })
@@ -536,11 +590,11 @@ function TicketsTab({ organizer, drawingId }: { organizer: Address; drawingId: b
   );
 }
 
-// Detail-page number ball (34px) — matches the design's ticket rows.
+// Detail-page number ball (~10% smaller than the design's 34px) — used in the ticket rows.
 function Ball({ children, bonus }: { children: React.ReactNode; bonus?: boolean }) {
   return (
     <span
-      className={`flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-full font-mono text-[13px] ${
+      className={`flex h-[31px] w-[31px] shrink-0 items-center justify-center rounded-full font-mono text-[12px] ${
         bonus ? "bg-accent font-bold text-bg shadow-[0_0_16px_rgba(198,255,58,0.45)]" : "border-[1.5px] border-white/[0.28] font-semibold text-txt"
       }`}
     >

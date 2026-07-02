@@ -9,6 +9,8 @@ export function ReserveSlider({
   onChange: (v: number) => void;
 }) {
   const fillPct = (value / 99) * 100;
+  // Fixed-width XX.X% so the readout and the "Your stake" sentence don't shift while dragging.
+  const pctLabel = `${value.toFixed(1).padStart(4, "0")}%`;
 
   return (
     <div>
@@ -17,9 +19,7 @@ export function ReserveSlider({
           <div className="text-[13px] text-txt-muted">Your reserve</div>
           <div className="text-[11px] text-txt-faint">The slice of the pool you keep</div>
         </div>
-        <div className="font-mono text-[42px] font-bold tracking-[-1.5px] text-accent">
-          {value % 1 === 0 ? value : value.toFixed(1)}%
-        </div>
+        <div className="font-mono text-[42px] font-bold tracking-[-1.5px] text-accent">{pctLabel}</div>
       </div>
 
       <input
@@ -38,7 +38,7 @@ export function ReserveSlider({
         <Bullet lead="Your stake:">
           {value === 0
             ? "you keep none of the pool. It's all for sale to friends."
-            : `you keep ${value % 1 === 0 ? value : value.toFixed(1)}% of the pool. The rest is for sale to friends.`}
+            : `you keep ${pctLabel} of the pool. The rest is for sale to friends.`}
         </Bullet>
         <Bullet lead="Your money back:">as friends buy in, you get repaid.</Bullet>
         <Bullet lead="The fees:">

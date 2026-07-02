@@ -60,3 +60,22 @@ body {
 .mp-fill {
   transition: width 0.7s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
+
+/* Settled-card Mega-ball glow (won state). Static shadow under reduced motion. */
+@keyframes rsGlow {
+  0%,
+  100% {
+    box-shadow: 0 0 16px rgba(198, 255, 58, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 26px rgba(198, 255, 58, 0.8);
+  }
+}
+.rs-glow {
+  box-shadow: 0 0 16px rgba(198, 255, 58, 0.5);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .rs-glow {
+    animation: rsGlow 2.4s ease-in-out infinite;
+  }
+}

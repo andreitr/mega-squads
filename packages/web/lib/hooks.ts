@@ -233,6 +233,8 @@ export function usePoolHolders(organizer?: Address, drawingId?: bigint) {
 }
 
 export type PortfolioPosition = LivePool & { shares: bigint; claimable: bigint };
+export type OrganizedPool = LivePool & { claimable: bigint };
+export type ClaimablePosition = { organizer: Address; drawingId: bigint; claimable: bigint };
 
 /**
  * The connected user's portfolio, read on-chain:
@@ -257,14 +259,11 @@ export function usePortfolio(user?: Address) {
   const hostedIds = (historyQ.data as readonly bigint[] | undefined) ?? [];
 
   const organizedQ = useReadContracts({
-    contracts: hostedIds.map((id) => ({
-      chainId: base.id,
-      address: SQUADS_ADDRESS,
-      abi: squadsAbi,
-      functionName: "getPool",
-      args: [user!, id],
-    })),
-    query: { enabled: Boolean(user) && hostedIds.length > 0, refetchInterval: 30_000 },
+    contracts: hostedIds.flatMap((id) => [
+      { chainId: base.id, address: SQUADS_ADDRESS, abi: squadsAbi, functionName: "getPool", args: [user!, id] },
+      { chainId: base.id, address: SQUADS_ADDRESS, abi: squadsAbi, functionName: "claimableOf", args: [user!, id, user!] },
+    ]),
+    query: { enabled: Boolean(user) && hostedIds.length > 0, refetchInterval: 15_000 },
   });
 
   // Pools the user has bought into (discover via SharesPurchased logs; holder is indexed).
@@ -343,14 +342,15 @@ export function usePortfolio(user?: Address) {
     return { drawingTime: ds?.drawingTime, winningTicket: ds?.winningTicket };
   };
 
-  const organized: LivePool[] = hostedIds
-    .map((id, i): LivePool | null => {
-      const raw = organizedQ.data?.[i]?.result as PoolRaw | undefined;
+  const organized: OrganizedPool[] = hostedIds
+    .map((id, i): OrganizedPool | null => {
+      const raw = organizedQ.data?.[i * 2]?.result as PoolRaw | undefined;
       if (!raw || !user) return null;
+      const claimable = (organizedQ.data?.[i * 2 + 1]?.result as bigint | undefined) ?? 0n;
       const p = parsePool(user, id, raw);
-      return { ...p, name: nameOf(user, id), vis: visualState(p, drawingStateOf(id), nowSec) };
+      return { ...p, name: nameOf(user, id), vis: visualState(p, drawingStateOf(id), nowSec), claimable };
     })
-    .filter((p): p is LivePool => p !== null && p.state !== 0)
+    .filter((p): p is OrganizedPool => p !== null && p.state !== 0)
     // Newest round first.
     .sort((a, b) => (b.drawingId > a.drawingId ? 1 : b.drawingId < a.drawingId ? -1 : 0));
 
@@ -365,12 +365,23 @@ export function usePortfolio(user?: Address) {
     })
     .filter((p): p is PortfolioPosition => p !== null && p.state !== 0);
 
-  const claimable = joined.reduce((sum, j) => sum + j.claimable, 0n);
+  // Claimable across BOTH joined positions and hosted pools, deduped by (organizer, drawingId) so a
+  // pool the user both hosted and bought into isn't counted twice (claimableOf is the same value).
+  const claimableByPool = new Map<string, ClaimablePosition>();
+  for (const j of joined) {
+    if (j.claimable > 0n) claimableByPool.set(`${j.organizer.toLowerCase()}-${j.drawingId}`, { organizer: j.organizer, drawingId: j.drawingId, claimable: j.claimable });
+  }
+  for (const o of organized) {
+    if (o.claimable > 0n) claimableByPool.set(`${o.organizer.toLowerCase()}-${o.drawingId}`, { organizer: o.organizer, drawingId: o.drawingId, claimable: o.claimable });
+  }
+  const claimablePositions = [...claimableByPool.values()];
+  const claimable = claimablePositions.reduce((sum, p) => sum + p.claimable, 0n);
 
   return {
     organized,
     joined,
     claimable,
+    claimablePositions,
     isLoading:
       historyQ.isLoading ||
       joinedLogsQ.isLoading ||

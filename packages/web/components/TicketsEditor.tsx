@@ -33,9 +33,6 @@ export function TicketsEditor({
     <div className="rounded-card border border-white/[0.06] bg-surface p-[17px]">
       <div className="mb-3 flex items-baseline justify-between">
         <span className="text-[14px] font-semibold text-txt">Tickets</span>
-        <span className="font-mono text-[12px] text-txt-faint">
-          {total} × $1.00 · ${total}.00
-        </span>
       </div>
 
       <div className="divide-y divide-white/[0.06]">
